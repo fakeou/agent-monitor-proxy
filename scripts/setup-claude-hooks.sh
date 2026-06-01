@@ -22,6 +22,7 @@ SETTINGS_FILE="$CLAUDE_DIR/settings.json"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOK_SOURCE="$SCRIPT_DIR/amp-hook.sh"
 HOOK_TARGET="$HOOKS_DIR/amp-hook.sh"
+AMP_URL="${AMP_URL:-http://127.0.0.1:9527/api/hooks/claude-code}"
 
 # 1. Create hooks directory
 mkdir -p "$HOOKS_DIR"
@@ -55,6 +56,7 @@ settings['hooks']['PreToolUse'] = hook_config
 settings['hooks']['PostToolUse'] = hook_config
 settings['hooks']['Notification'] = hook_config
 settings['hooks']['Stop'] = hook_config
+settings['hooks']['SubagentStop'] = hook_config
 
 with open('$SETTINGS_FILE', 'w') as f:
     json.dump(settings, f, indent=2)
@@ -89,6 +91,12 @@ else
                 "type": "command",
                 "command": "$HOOK_TARGET"
             }
+        ],
+        "SubagentStop": [
+            {
+                "type": "command",
+                "command": "$HOOK_TARGET"
+            }
         ]
     }
 }
@@ -107,3 +115,5 @@ echo "  - PreToolUse: Before using a tool"
 echo "  - PostToolUse: After using a tool"
 echo "  - Notification: When a notification occurs"
 echo "  - Stop: When the session stops"
+echo "  - SubagentStop: When a subagent stops"
+echo "Forward target: $AMP_URL"

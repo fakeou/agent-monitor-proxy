@@ -29,12 +29,6 @@ const KNOWN_AGENTS: Array<{
     displayName: 'Claude Code',
   },
   {
-    patterns: [/\/bin\/codex[\s/]/i, /\/bin\/codex$/i, /codex-darwin.*\/codex[\s/]/i],
-    type: 'codex',
-    kind: 'cli',
-    displayName: 'Codex CLI',
-  },
-  {
     patterns: [/\/opencode[\s/]/i, /\/opencode$/i],
     type: 'opencode',
     kind: 'cli',
@@ -51,14 +45,6 @@ const KNOWN_AGENTS: Array<{
     type: 'kimi-code',
     kind: 'cli',
     displayName: 'Kimi Code',
-  },
-  // App agents — match the main app process only (not sub-processes)
-  {
-    patterns: [/Codex\.app\/Contents\/MacOS\/Codex/i],
-    type: 'codex-app',
-    kind: 'app',
-    displayName: 'Codex App',
-    mainProcessOnly: true,
   },
   {
     patterns: [/Cursor\.app\/Contents\/MacOS\/Cursor/i],

@@ -7,6 +7,7 @@
 
 import type { AgentDescriptor, AgentInstance, AdapterConfig } from '../core/types.js'
 import type { EventBus } from '../core/bus.js'
+import type { InstanceManager } from '../core/manager.js'
 
 /**
  * Context provided to adapters during initialization.
@@ -14,6 +15,8 @@ import type { EventBus } from '../core/bus.js'
 export interface AdapterContext {
   /** Emit events to the central event bus */
   bus: EventBus
+  /** Update tracked instance state and stats */
+  manager: InstanceManager
   /** Adapter-specific configuration */
   config: AdapterConfig
   /** Resolve home directory paths */

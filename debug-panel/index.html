@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AMP Debug Panel</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace;
+      background: #0d1117;
+      color: #c9d1d9;
+      padding: 16px;
+      font-size: 13px;
+    }
+    h1 { color: #58a6ff; font-size: 18px; margin-bottom: 12px; }
+    h2 { color: #8b949e; font-size: 14px; margin: 12px 0 8px; text-transform: uppercase; letter-spacing: 1px; }
+
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #21262d;
+    }
+    .status { display: flex; align-items: center; gap: 8px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #f85149; }
+    .dot.connected { background: #3fb950; }
+    .refresh-btn {
+      background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+      padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;
+    }
+    .refresh-btn:hover { background: #30363d; }
+
+    .summary-cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-bottom: 16px; }
+    .card {
+      background: #161b22; border: 1px solid #21262d; border-radius: 6px;
+      padding: 12px; text-align: center;
+    }
+    .card .value { font-size: 28px; font-weight: bold; color: #58a6ff; }
+    .card .label { font-size: 11px; color: #8b949e; margin-top: 4px; }
+
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .panel {
+      background: #161b22; border: 1px solid #21262d; border-radius: 8px;
+      padding: 12px; overflow: auto;
+    }
+    .panel.full { grid-column: 1 / -1; }
+
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #21262d; font-size: 12px; }
+    th { color: #8b949e; font-weight: 600; }
+
+    .state {
+      display: inline-block; padding: 2px 8px; border-radius: 10px;
+      font-size: 11px; font-weight: 600;
+    }
+    .state-idle { background: #21262d; color: #8b949e; }
+    .state-thinking { background: #1f3a5f; color: #58a6ff; }
+    .state-executing { background: #2d1f0a; color: #d29922; }
+    .state-waiting_input { background: #2d1f3a; color: #bc8cff; }
+    .state-completed { background: #1a3a1a; color: #3fb950; }
+    .state-interrupted { background: #2d2630; color: #ffab70; }
+    .state-failed { background: #3a1a1a; color: #f85149; }
+    .state-stopped { background: #1a1a1a; color: #484f58; }
+
+    .event-log {
+      max-height: 400px; overflow-y: auto;
+      font-family: 'SF Mono', 'Fira Code', monospace; font-size: 11px;
+    }
+    .event-entry {
+      padding: 4px 8px; border-bottom: 1px solid #21262d;
+      display: flex; gap: 12px;
+    }
+    .event-entry:hover { background: #1c2128; }
+    .event-time { color: #484f58; min-width: 80px; }
+    .event-type { min-width: 140px; font-weight: 600; }
+    .event-type.state_change { color: #58a6ff; }
+    .event-type.token_usage { color: #d29922; }
+    .event-type.tool_call { color: #bc8cff; }
+    .event-type.tool_result { color: #3fb950; }
+    .event-type.message { color: #c9d1d9; }
+    .event-type.instance_discovered { color: #3fb950; }
+    .event-type.instance_lost { color: #f85149; }
+    .event-type.completed { color: #3fb950; }
+    .event-type.init { color: #58a6ff; }
+    .event-data { color: #8b949e; flex: 1; word-break: break-all; }
+    .empty { color: #484f58; font-style: italic; padding: 20px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>🔍 Agent Monitor Proxy — Debug Panel</h1>
+    <div class="status">
+      <div class="dot" id="status-dot"></div>
+      <span id="status-text">Connecting...</span>
+      <button class="refresh-btn" onclick="refresh()">↻ Refresh</button>
+    </div>
+  </div>
+
+  <div class="summary-cards" id="summary-cards">
+    <div class="card"><div class="value" id="s-total">-</div><div class="label">Total Agents</div></div>
+    <div class="card"><div class="value" id="s-active">-</div><div class="label">Active</div></div>
+    <div class="card"><div class="value" id="s-tokens">-</div><div class="label">Current Tokens</div></div>
+    <div class="card"><div class="value" id="s-tools">-</div><div class="label">Tool Calls</div></div>
+    <div class="card"><div class="value" id="s-msgs">-</div><div class="label">Messages</div></div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>📦 Instances</h2>
+      <table>
+        <thead><tr><th>Type</th><th>Kind</th><th>State</th><th>Current Tokens</th><th>Tools</th><th>Session</th></tr></thead>
+        <tbody id="instances-body"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>📊 By Type</h2>
+      <table>
+        <thead><tr><th>Type</th><th>Count</th><th>Current Tokens</th></tr></thead>
+        <tbody id="types-body"><tr><td colspan="3" class="empty">Loading...</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel full">
+      <h2>📡 Event Log <span id="event-count" style="color:#484f58">(0)</span></h2>
+      <div class="event-log" id="event-log"><div class="empty">Waiting for events...</div></div>
+    </div>
+  </div>
+
+  <script>
+    const WebSocket = require('ws')
+    const events = []
+    let instancesCache = []
+    const MAX_EVENTS = 500
+    const AMP_WS = 'ws://127.0.0.1:9527'
+    const AMP_HTTP = 'http://127.0.0.1:9527'
+
+    // ── WebSocket ──────────────────────────────────────────
+    let ws = null
+    function connectWS() {
+      ws = new WebSocket(AMP_WS)
+      ws.on('open', () => {
+        document.getElementById('status-dot').classList.add('connected')
+        document.getElementById('status-text').textContent = 'Connected'
+        addEvent({ type: 'system', timestamp: Date.now(), data: { msg: 'WebSocket connected' } })
+      })
+      ws.on('message', (data) => {
+        try {
+          const event = JSON.parse(data.toString())
+          addEvent(event)
+          applyEvent(event)
+        } catch {}
+      })
+      ws.on('close', () => {
+        document.getElementById('status-dot').classList.remove('connected')
+        document.getElementById('status-text').textContent = 'Disconnected — reconnecting...'
+        setTimeout(connectWS, 3000)
+      })
+      ws.on('error', () => {})
+    }
+
+    function applyEvent(event) {
+      if (event.type === 'init') {
+        instancesCache = event.data?.instances || []
+        renderInstances(instancesCache)
+        renderSummary(instancesCache)
+        return
+      }
+
+      if (event.type === 'instance_discovered' || event.type === 'instance_lost') {
+        if (event.type === 'instance_discovered') {
+          instancesCache = instancesCache.filter(i => i.id !== event.instanceId).concat([{
+            id: event.instanceId,
+            type: event.data?.type,
+            kind: event.data?.kind,
+            displayName: event.data?.displayName,
+            pid: event.data?.pid,
+            projectPath: event.data?.projectPath,
+            state: 'idle',
+            stateChangedAt: event.timestamp,
+            stats: { totalTokens: 0, promptTokens: 0, completionTokens: 0, toolCallCount: 0, messageCount: 0, requestCount: 0, durationMs: 0 },
+            currentTaskTokens: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+            session: { id: event.instanceId, startTime: event.timestamp, lastActivity: event.timestamp, messages: [], toolCalls: [] },
+            discoveredAt: event.timestamp,
+            lastActivityAt: event.timestamp,
+          }])
+        } else {
+          instancesCache = instancesCache.filter(i => i.id !== event.instanceId)
+        }
+        renderInstances(instancesCache)
+        renderSummary(instancesCache)
+        return
+      }
+
+      const instance = instancesCache.find(i => i.id === event.instanceId)
+      if (!instance) return
+
+      if (event.type === 'state_change') {
+        instance.state = event.data.newState
+        instance.stateChangedAt = event.timestamp
+        if (event.data.currentTaskTokens) {
+          instance.currentTaskTokens = event.data.currentTaskTokens
+        }
+      }
+
+      if (event.type === 'token_update') {
+        instance.currentTaskTokens = event.data.currentTaskTokens
+      }
+
+      if (event.type === 'tool_call' || event.type === 'tool_result') {
+        instance.stats.toolCallCount = Number(instance.stats.toolCallCount || 0) + 1
+      }
+
+      if (event.type === 'message') {
+        instance.stats.messageCount = Number(instance.stats.messageCount || 0) + 1
+      }
+
+      renderInstances(instancesCache)
+      renderSummary(instancesCache)
+    }
+
+    function addEvent(event) {
+      events.unshift(event)
+      if (events.length > MAX_EVENTS) events.length = MAX_EVENTS
+      renderEvent(event)
+      document.getElementById('event-count').textContent = `(${events.length})`
+    }
+
+    function renderEvent(event) {
+      const log = document.getElementById('event-log')
+      if (log.querySelector('.empty')) log.innerHTML = ''
+      const entry = document.createElement('div')
+      entry.className = 'event-entry'
+      const time = new Date(event.timestamp).toLocaleTimeString()
+      const dataStr = JSON.stringify(event.data || {})
+      const shortData = dataStr.length > 150 ? dataStr.slice(0, 150) + '...' : dataStr
+      entry.innerHTML = `
+        <span class="event-time">${time}</span>
+        <span class="event-type ${event.type}">${event.type}</span>
+        <span class="event-data">${event.instanceId || ''} ${shortData}</span>
+      `
+      log.insertBefore(entry, log.firstChild)
+      while (log.children.length > 200) log.removeChild(log.lastChild)
+    }
+
+    // ── HTTP Fetch ─────────────────────────────────────────
+    async function refresh() {
+      try {
+        const [instances, summary] = await Promise.all([
+          fetch(`${AMP_HTTP}/api/instances`).then(r => r.json()),
+          fetch(`${AMP_HTTP}/api/summary`).then(r => r.json()),
+        ])
+        instancesCache = instances
+        renderInstances(instancesCache)
+        renderSummary(instancesCache)
+      } catch (err) {
+        console.error('Refresh failed:', err)
+      }
+    }
+
+    function renderInstances(instances) {
+      const tbody = document.getElementById('instances-body')
+      if (!instances.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty">No instances</td></tr>'
+        return
+      }
+      tbody.innerHTML = instances.map(i => `
+        <tr>
+          <td>${i.type}</td>
+          <td>${i.kind}</td>
+          <td><span class="state state-${i.state}">${i.state}</span></td>
+          <td title="${formatTokenBreakdown(i.currentTaskTokens)}">${getCurrentTokens(i).toLocaleString()}</td>
+          <td>${i.stats.toolCallCount}</td>
+          <td title="${i.id}">${(i.sessionId || i.watchPath || i.id || '-').slice(0, 20)}</td>
+        </tr>
+      `).join('')
+    }
+
+    function renderSummary(instances) {
+      const currentTotalTokens = instances.reduce((sum, i) => sum + getCurrentTokens(i), 0)
+      const totalToolCalls = instances.reduce((sum, i) => sum + Number(i.stats?.toolCallCount || 0), 0)
+      const totalMessages = instances.reduce((sum, i) => sum + Number(i.stats?.messageCount || 0), 0)
+      document.getElementById('s-total').textContent = instances.length
+      document.getElementById('s-active').textContent = instances.filter(i => !['stopped', 'completed'].includes(i.state)).length
+      document.getElementById('s-tokens').textContent = currentTotalTokens.toLocaleString()
+      document.getElementById('s-tools').textContent = totalToolCalls
+      document.getElementById('s-msgs').textContent = totalMessages
+
+      const tbody = document.getElementById('types-body')
+      const byType = instances.reduce((acc, i) => {
+        if (!acc[i.type]) acc[i.type] = { count: 0, tokens: 0 }
+        acc[i.type].count++
+        acc[i.type].tokens += getCurrentTokens(i)
+        return acc
+      }, {})
+      const types = Object.entries(byType)
+      if (!types.length) {
+        tbody.innerHTML = '<tr><td colspan="3" class="empty">No data</td></tr>'
+        return
+      }
+      tbody.innerHTML = types.map(([t, d]) => `
+        <tr><td>${t}</td><td>${d.count}</td><td>${d.tokens.toLocaleString()}</td></tr>
+      `).join('')
+    }
+
+    function getCurrentTokens(instance) {
+      return Number(instance.currentTaskTokens?.totalTokens || 0)
+    }
+
+    function formatTokenBreakdown(tokens) {
+      const prompt = Number(tokens?.promptTokens || 0).toLocaleString()
+      const completion = Number(tokens?.completionTokens || 0).toLocaleString()
+      const cached = Number(tokens?.cachedPromptTokens || 0).toLocaleString()
+      const reasoning = Number(tokens?.reasoningTokens || 0).toLocaleString()
+      return `prompt ${prompt}, completion ${completion}, cached ${cached}, reasoning ${reasoning}`
+    }
+
+    // ── Init ───────────────────────────────────────────────
+    connectWS()
+  </script>
+</body>
+</html>

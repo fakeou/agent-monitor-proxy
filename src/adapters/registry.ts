@@ -8,14 +8,17 @@
 import type { AgentAdapter, AdapterContext } from './base.js'
 import type { AgentDescriptor, AgentInstance, AdapterConfig } from '../core/types.js'
 import type { EventBus } from '../core/bus.js'
+import type { InstanceManager } from '../core/manager.js'
 import { homedir } from 'node:os'
 
 export class AdapterRegistry {
   private adapters = new Map<string, AgentAdapter>()
   private bus: EventBus
+  private manager: InstanceManager
 
-  constructor(bus: EventBus) {
+  constructor(bus: EventBus, manager: InstanceManager) {
     this.bus = bus
+    this.manager = manager
   }
 
   /**
@@ -42,6 +45,7 @@ export class AdapterRegistry {
 
       const ctx: AdapterContext = {
         bus: this.bus,
+        manager: this.manager,
         config,
         homeDir: home,
       }

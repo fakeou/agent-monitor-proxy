@@ -13,11 +13,12 @@ export type AgentState =
   | 'executing'      // Running a tool (Bash, Read, Write, etc.)
   | 'waiting_input'  // Needs user input (approval, prompt, etc.)
   | 'completed'      // Task finished successfully
+  | 'interrupted'    // User interrupted the task
   | 'failed'         // Task failed / errored
   | 'stopped'        // Process exited
 
 export const AGENT_STATE_ORDER: AgentState[] = [
-  'idle', 'thinking', 'executing', 'waiting_input', 'completed', 'failed', 'stopped',
+  'idle', 'thinking', 'executing', 'waiting_input', 'completed', 'interrupted', 'failed', 'stopped',
 ]
 
 // ─── Agent Instance ─────────────────────────────────────────────
@@ -48,6 +49,8 @@ export interface AgentInstance {
 
   /** Accumulated statistics */
   stats: AgentStats
+  /** Token usage for the currently active task/turn. Resets after settlement. */
+  currentTaskTokens: TokenBucket
   /** Current session info */
   session: SessionInfo
 
@@ -66,6 +69,23 @@ export interface AgentStats {
   requestCount: number
   /** Total active time in ms */
   durationMs: number
+}
+
+export interface TokenBucket {
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+  cachedPromptTokens?: number
+  reasoningTokens?: number
+  updatedAt?: number
+}
+
+export function createEmptyTokenBucket(): TokenBucket {
+  return {
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+  }
 }
 
 export function createEmptyStats(): AgentStats {
@@ -125,6 +145,7 @@ export type MonitorEventType =
   | 'message'
   | 'tool_call'
   | 'tool_result'
+  | 'token_update'
   | 'token_usage'
   | 'completed'
   | 'error'
@@ -142,14 +163,21 @@ export interface StateChangeEvent {
   agentType: string
   agentKind: 'cli' | 'app'
   project?: string
+  currentTaskTokens: TokenBucket
 }
 
 export interface TokenUsageEvent {
-  promptTokens: number
-  completionTokens: number
-  totalTokens: number
+  settlementId: string
+  settledTokens: TokenBucket
   model?: string
   requestId?: string
+  reason?: string
+}
+
+export interface TokenUpdateEvent {
+  updateKind: 'delta' | 'reset'
+  deltaTokens: TokenBucket
+  currentTaskTokens: TokenBucket
 }
 
 export interface MessageEvent {

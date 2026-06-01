@@ -73,6 +73,7 @@ export class DiscoveryOrchestrator {
 
     // 3. Register new instances
     const currentIds = new Set<string>()
+    let newCount = 0
 
     for (const descriptor of allDescriptors) {
       const instance = this.manager.register(descriptor)
@@ -80,16 +81,22 @@ export class DiscoveryOrchestrator {
 
       // Start watching if newly discovered
       if (!this.knownSessions.has(instance.id)) {
+        newCount++
         this.knownSessions.add(instance.id)
         const adapter = this.registry.get(descriptor.type)
         if (adapter) {
           try {
             await adapter.startWatching(instance)
+            console.log(`[discovery] Now watching: ${instance.id} (${descriptor.type})`)
           } catch (err) {
             console.error(`[discovery] Failed to start watching ${instance.id}:`, err)
           }
         }
       }
+    }
+
+    if (newCount > 0) {
+      console.log(`[discovery] Found ${newCount} new instance(s), total: ${currentIds.size}`)
     }
 
     // 4. Detect lost instances (process-based)

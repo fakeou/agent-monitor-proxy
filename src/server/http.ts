@@ -210,8 +210,8 @@ export class AMPHttpServer {
     const body = await this.readBody(req)
     try {
       const hook = JSON.parse(body)
-      // Use same ID format as InstanceManager.buildId: "{type}-{sessionId.slice(0,12)}"
-      const instanceId = `claude-code-${(hook.session_id ?? 'unknown').slice(0, 12)}`
+      const sessionId = hook.session_id ?? 'unknown'
+      const instanceId = this.buildSessionInstanceId('claude-code', sessionId)
 
       // Ensure instance exists
       if (!this.manager.get(instanceId)) {
@@ -252,7 +252,7 @@ export class AMPHttpServer {
           break
         }
         case 'Stop': {
-          newState = 'completed'
+          newState = 'idle'
           this.bus.emit({
             type: 'completed',
             instanceId,
@@ -262,7 +262,7 @@ export class AMPHttpServer {
           break
         }
         case 'SubagentStop': {
-          newState = 'completed'
+          newState = 'idle'
           break
         }
       }
@@ -305,6 +305,11 @@ export class AMPHttpServer {
       req.on('data', (chunk) => { body += chunk.toString() })
       req.on('end', () => { resolve(body) })
     })
+  }
+
+  private buildSessionInstanceId(type: string, sessionId: string): string {
+    const suffix = sessionId.length > 20 ? sessionId.slice(-20) : sessionId
+    return `${type}-${suffix}`
   }
 
   // ── Helpers ──────────────────────────────────────────────────

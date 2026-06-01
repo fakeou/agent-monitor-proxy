@@ -8,10 +8,9 @@
  *    The hook script POSTs data to AMP's /api/hooks/claude-code endpoint.
  *    → Zero polling, instant state updates
  *
- * 2. SESSION FILES (secondary, for history/token counting):
+ * 2. SESSION FILES (secondary, for discovery only):
  *    Session JSONL files in ~/.claude/projects/<project>/<uuid>.jsonl
- *    Parsed on discovery to extract historical token usage.
- *    → One-time scan, no ongoing polling
+ *    Used only to discover active sessions and attach metadata.
  */
 
 import { readdir, readFile, stat } from 'node:fs/promises'
@@ -36,7 +35,7 @@ export class ClaudeCodeAdapter extends BaseAdapter {
    * Used for initial registration — real-time updates come via hooks.
    */
   async discover(): Promise<AgentDescriptor[]> {
-    const descriptors: AgentDescriptor[] = []
+    const candidates: Array<{ descriptor: AgentDescriptor; mtimeMs: number }> = []
 
     try {
       const projectsDir = join(this.sessionDir, 'projects')
@@ -57,13 +56,16 @@ export class ClaudeCodeAdapter extends BaseAdapter {
           // Include sessions from last 72 hours
           if (Date.now() - st.mtimeMs > 72 * 60 * 60 * 1000) continue
 
-          descriptors.push({
-            type: this.type,
-            kind: this.kind,
-            displayName: `${this.displayName} (${basename(projectPath)})`,
-            sessionId: entry.replace('.jsonl', ''),
-            projectPath,
-            watchPath: sessionPath,
+          candidates.push({
+            descriptor: {
+              type: this.type,
+              kind: this.kind,
+              displayName: `${this.displayName} (${basename(projectPath)})`,
+              sessionId: entry.replace('.jsonl', ''),
+              projectPath,
+              watchPath: sessionPath,
+            },
+            mtimeMs: st.mtimeMs,
           })
         }
       }
@@ -71,59 +73,21 @@ export class ClaudeCodeAdapter extends BaseAdapter {
       // ~/.claude doesn't exist
     }
 
-    return descriptors
+    const latest = candidates.sort((a, b) => b.mtimeMs - a.mtimeMs)[0]
+    if (!latest) return []
+
+    for (const instance of this.ctx.manager.getByType(this.type)) {
+      if (instance.sessionId === latest.descriptor.sessionId) continue
+      await this.stopWatching(instance.id)
+      this.ctx.manager.unregister(instance.id)
+    }
+
+    return [latest.descriptor]
   }
 
-  /**
-   * Start watching — for Claude Code, this is a no-op.
-   * Real-time monitoring is handled by hooks posting to /api/hooks/claude-code.
-   * We just do an initial token usage scan of the session file.
-   */
   async startWatching(instance: AgentInstance): Promise<void> {
     if (!instance.watchPath) return
-
-    // One-time scan: extract historical token usage from the session file
-    this.scanTokenUsage(instance.id, instance.watchPath)
-  }
-
-  /**
-   * Scan a session file for token usage data (one-time, not ongoing).
-   */
-  private async scanTokenUsage(instanceId: string, filePath: string): Promise<void> {
-    try {
-      const content = await readFile(filePath, 'utf-8')
-      const lines = content.split('\n')
-
-      let totalPrompt = 0
-      let totalCompletion = 0
-
-      for (const line of lines) {
-        if (!line.trim()) continue
-        try {
-          const entry = JSON.parse(line)
-          if (entry.type === 'assistant' && entry.usage) {
-            totalPrompt += entry.usage.input_tokens ?? 0
-            totalCompletion += entry.usage.output_tokens ?? 0
-          }
-        } catch { /* skip */ }
-      }
-
-      if (totalPrompt > 0 || totalCompletion > 0) {
-        this.ctx.bus.emit({
-          type: 'token_usage',
-          instanceId,
-          timestamp: Date.now(),
-          data: {
-            promptTokens: totalPrompt,
-            completionTokens: totalCompletion,
-            totalTokens: totalPrompt + totalCompletion,
-            source: 'historical_scan',
-          },
-        })
-      }
-    } catch {
-      // Can't read file — that's fine
-    }
+    void instance
   }
 }
 

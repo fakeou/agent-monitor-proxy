@@ -14,8 +14,9 @@ import type {
   StateChangeEvent,
   TokenUsageEvent,
   SessionInfo,
+  TokenBucket,
 } from './types.js'
-import { createEmptyStats, createEmptySession } from './types.js'
+import { createEmptyStats, createEmptySession, createEmptyTokenBucket } from './types.js'
 import { EventBus } from './bus.js'
 
 export class InstanceManager {
@@ -55,6 +56,7 @@ export class InstanceManager {
       state: 'idle',
       stateChangedAt: Date.now(),
       stats: createEmptyStats(),
+      currentTaskTokens: createEmptyTokenBucket(),
       session: createEmptySession(descriptor.sessionId ?? id),
       discoveredAt: Date.now(),
       lastActivityAt: Date.now(),
@@ -156,6 +158,7 @@ export class InstanceManager {
         agentType: instance.type,
         agentKind: instance.kind,
         project: instance.projectPath,
+        currentTaskTokens: { ...instance.currentTaskTokens },
       } satisfies StateChangeEvent,
     })
 
@@ -167,14 +170,31 @@ export class InstanceManager {
    */
   recordTokenUsage(
     instanceId: string,
-    usage: { promptTokens: number; completionTokens: number; model?: string; requestId?: string },
+    usage: {
+      promptTokens: number
+      completionTokens: number
+      model?: string
+      requestId?: string
+      reason?: string
+      cachedPromptTokens?: number
+      reasoningTokens?: number
+      settle?: boolean
+    },
   ): void {
     const instance = this.instances.get(instanceId)
     if (!instance) return
 
-    instance.stats.promptTokens += usage.promptTokens
-    instance.stats.completionTokens += usage.completionTokens
-    instance.stats.totalTokens += usage.promptTokens + usage.completionTokens
+    instance.currentTaskTokens.promptTokens += usage.promptTokens
+    instance.currentTaskTokens.completionTokens += usage.completionTokens
+    instance.currentTaskTokens.totalTokens += usage.promptTokens + usage.completionTokens
+    instance.currentTaskTokens.cachedPromptTokens = usage.cachedPromptTokens ?? instance.currentTaskTokens.cachedPromptTokens
+    instance.currentTaskTokens.reasoningTokens = usage.reasoningTokens ?? instance.currentTaskTokens.reasoningTokens
+    instance.currentTaskTokens.updatedAt = Date.now()
+    if (usage.settle) {
+      instance.stats.promptTokens += instance.currentTaskTokens.promptTokens
+      instance.stats.completionTokens += instance.currentTaskTokens.completionTokens
+      instance.stats.totalTokens += instance.currentTaskTokens.totalTokens
+    }
     instance.stats.requestCount++
     instance.lastActivityAt = Date.now()
     instance.session.lastActivity = Date.now()
@@ -184,13 +204,147 @@ export class InstanceManager {
       instanceId,
       timestamp: Date.now(),
       data: {
-        promptTokens: usage.promptTokens,
-        completionTokens: usage.completionTokens,
-        totalTokens: usage.promptTokens + usage.completionTokens,
+        settlementId: `${instanceId}:${usage.reason ?? 'usage'}:${instance.currentTaskTokens.updatedAt ?? Date.now()}`,
+        settledTokens: { ...instance.currentTaskTokens },
         model: usage.model,
         requestId: usage.requestId,
+        reason: usage.reason,
       } satisfies TokenUsageEvent,
     })
+  }
+
+  commitTokenBucket(
+    instanceId: string,
+    reason: string,
+    options?: { model?: string; requestId?: string },
+  ): TokenBucket | null {
+    const instance = this.instances.get(instanceId)
+    if (!instance) return null
+
+    const snapshot = { ...instance.currentTaskTokens, updatedAt: Date.now() }
+    if (snapshot.totalTokens <= 0) {
+      instance.currentTaskTokens = createEmptyTokenBucket()
+      return snapshot
+    }
+
+    instance.stats.promptTokens += snapshot.promptTokens
+    instance.stats.completionTokens += snapshot.completionTokens
+    instance.stats.totalTokens += snapshot.totalTokens
+    instance.stats.requestCount++
+
+    this.bus.emit({
+      type: 'token_usage',
+      instanceId,
+      timestamp: Date.now(),
+      data: {
+        settlementId: `${instanceId}:${reason}:${snapshot.updatedAt ?? Date.now()}`,
+        settledTokens: snapshot,
+        model: options?.model,
+        requestId: options?.requestId,
+        reason,
+      } satisfies TokenUsageEvent,
+    })
+
+    instance.currentTaskTokens = createEmptyTokenBucket()
+    this.bus.emit({
+      type: 'token_update',
+      instanceId,
+      timestamp: Date.now(),
+      data: {
+        updateKind: 'reset',
+        deltaTokens: createEmptyTokenBucket(),
+        currentTaskTokens: { ...instance.currentTaskTokens },
+      },
+    })
+    return snapshot
+  }
+
+  addCurrentTaskTokens(
+    instanceId: string,
+    delta: {
+      promptTokens?: number
+      completionTokens?: number
+      cachedPromptTokens?: number
+      reasoningTokens?: number
+    },
+  ): TokenBucket | null {
+    const instance = this.instances.get(instanceId)
+    if (!instance) return null
+    const deltaTokens: TokenBucket = {
+      promptTokens: delta.promptTokens ?? 0,
+      completionTokens: delta.completionTokens ?? 0,
+      totalTokens: (delta.promptTokens ?? 0) + (delta.completionTokens ?? 0),
+      cachedPromptTokens: delta.cachedPromptTokens,
+      reasoningTokens: delta.reasoningTokens,
+      updatedAt: Date.now(),
+    }
+
+    instance.currentTaskTokens.promptTokens += deltaTokens.promptTokens
+    instance.currentTaskTokens.completionTokens += deltaTokens.completionTokens
+    instance.currentTaskTokens.totalTokens += deltaTokens.totalTokens
+    if (typeof delta.cachedPromptTokens === 'number') {
+      instance.currentTaskTokens.cachedPromptTokens =
+        (instance.currentTaskTokens.cachedPromptTokens ?? 0) + delta.cachedPromptTokens
+    }
+    if (typeof delta.reasoningTokens === 'number') {
+      instance.currentTaskTokens.reasoningTokens =
+        (instance.currentTaskTokens.reasoningTokens ?? 0) + delta.reasoningTokens
+    }
+    instance.currentTaskTokens.updatedAt = Date.now()
+    instance.lastActivityAt = Date.now()
+    instance.session.lastActivity = Date.now()
+    this.bus.emit({
+      type: 'token_update',
+      instanceId,
+      timestamp: Date.now(),
+      data: {
+        updateKind: 'delta',
+        deltaTokens,
+        currentTaskTokens: { ...instance.currentTaskTokens },
+      },
+    })
+    return { ...instance.currentTaskTokens }
+  }
+
+  updateCurrentTokenBucket(
+    instanceId: string,
+    bucket: Partial<TokenBucket>,
+  ): TokenBucket | null {
+    const instance = this.instances.get(instanceId)
+    if (!instance) return null
+
+    if (typeof bucket.promptTokens === 'number') {
+      instance.currentTaskTokens.promptTokens = bucket.promptTokens
+    }
+    if (typeof bucket.completionTokens === 'number') {
+      instance.currentTaskTokens.completionTokens = bucket.completionTokens
+    }
+    if (typeof bucket.totalTokens === 'number') {
+      instance.currentTaskTokens.totalTokens = bucket.totalTokens
+    } else {
+      instance.currentTaskTokens.totalTokens =
+        instance.currentTaskTokens.promptTokens + instance.currentTaskTokens.completionTokens
+    }
+    if (typeof bucket.cachedPromptTokens === 'number') {
+      instance.currentTaskTokens.cachedPromptTokens = bucket.cachedPromptTokens
+    }
+    if (typeof bucket.reasoningTokens === 'number') {
+      instance.currentTaskTokens.reasoningTokens = bucket.reasoningTokens
+    }
+    instance.currentTaskTokens.updatedAt = Date.now()
+    instance.lastActivityAt = Date.now()
+    instance.session.lastActivity = Date.now()
+    this.bus.emit({
+      type: 'token_update',
+      instanceId,
+      timestamp: Date.now(),
+      data: {
+        updateKind: 'reset',
+        deltaTokens: { ...instance.currentTaskTokens },
+        currentTaskTokens: { ...instance.currentTaskTokens },
+      },
+    })
+    return { ...instance.currentTaskTokens }
   }
 
   /**
@@ -282,7 +436,7 @@ export class InstanceManager {
     const byType: Record<string, { count: number; tokens: number }> = {}
     const byState: Record<AgentState, number> = {
       idle: 0, thinking: 0, executing: 0, waiting_input: 0,
-      completed: 0, failed: 0, stopped: 0,
+      completed: 0, interrupted: 0, failed: 0, stopped: 0,
     }
 
     let totalTokens = 0
@@ -323,7 +477,12 @@ export class InstanceManager {
   private buildId(descriptor: AgentDescriptor): string {
     const parts = [descriptor.type]
     if (descriptor.pid) parts.push(String(descriptor.pid))
-    else if (descriptor.sessionId) parts.push(descriptor.sessionId.slice(0, 12))
+    else if (descriptor.sessionId) {
+      // Use last 20 chars of session ID to avoid collisions (e.g., rollout-2026-...)
+      // Session IDs are typically UUIDs or timestamps, so the tail is most unique
+      const id = descriptor.sessionId
+      parts.push(id.length > 20 ? id.slice(-20) : id)
+    }
     else parts.push(String(Date.now()))
     return parts.join('-')
   }

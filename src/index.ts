@@ -45,7 +45,7 @@ export class AgentMonitorProxy {
     this.manager = new InstanceManager(this.bus)
 
     // Adapters
-    this.registry = new AdapterRegistry(this.bus)
+    this.registry = new AdapterRegistry(this.bus, this.manager)
 
     // Register built-in adapters
     this.registry.register(new ClaudeCodeAdapter())

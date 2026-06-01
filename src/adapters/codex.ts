@@ -16,11 +16,13 @@
  *   type=session_meta                           → Session metadata (has cwd)
  */
 
-import { readdir, readFile, stat, open } from 'node:fs/promises'
+import { readdir, readFile, stat } from 'node:fs/promises'
 import { watch, type FSWatcher } from 'node:fs'
 import { join, basename } from 'node:path'
 import type { AgentDescriptor, AgentInstance, AgentState } from '../core/types.js'
 import { BaseAdapter } from './base.js'
+
+const SESSION_ACTIVE_WINDOW_MS = 12 * 60 * 60 * 1000
 
 export class CodexAdapter extends BaseAdapter {
   readonly type = 'codex'
@@ -30,6 +32,8 @@ export class CodexAdapter extends BaseAdapter {
   private sessionDir = ''
   private fsWatchers = new Map<string, FSWatcher>()
   private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private staleTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private seenTokenCountLines = new Map<string, Set<string>>()
 
   async init(ctx: import('./base.js').AdapterContext): Promise<void> {
     await super.init(ctx)
@@ -37,19 +41,31 @@ export class CodexAdapter extends BaseAdapter {
   }
 
   async discover(): Promise<AgentDescriptor[]> {
-    const descriptors: AgentDescriptor[] = []
+    const candidates: Array<{ descriptor: AgentDescriptor; mtimeMs: number }> = []
     try {
       const sessionsDir = join(this.sessionDir, 'sessions')
-      await this.scanDir(sessionsDir, descriptors, 0)
+      await this.scanDir(sessionsDir, candidates, 0)
     } catch {
       // ~/.codex doesn't exist
     }
-    return descriptors
+
+    const latest = candidates.sort((a, b) => b.mtimeMs - a.mtimeMs)[0]
+    if (!latest) {
+      return []
+    }
+
+    for (const instance of this.ctx.manager.getByType(this.type)) {
+      if (instance.sessionId === latest.descriptor.sessionId) continue
+      await this.stopWatching(instance.id)
+      this.ctx.manager.unregister(instance.id)
+    }
+
+    return [latest.descriptor]
   }
 
   private async scanDir(
     dir: string,
-    descriptors: AgentDescriptor[],
+    candidates: Array<{ descriptor: AgentDescriptor; mtimeMs: number }>,
     depth: number,
   ): Promise<void> {
     if (depth > 5) return
@@ -60,21 +76,29 @@ export class CodexAdapter extends BaseAdapter {
       if (!st) continue
 
       if (entry.endsWith('.jsonl')) {
-        if (Date.now() - st.mtimeMs > 72 * 60 * 60 * 1000) continue
+        const ageMs = Date.now() - st.mtimeMs
+        if (ageMs > SESSION_ACTIVE_WINDOW_MS) {
+          continue
+        }
+
         const sessionId = entry.replace('.jsonl', '')
         const projectPath = await extractProjectPath(fullPath)
-        descriptors.push({
-          type: this.type,
-          kind: this.kind,
-          displayName: projectPath
-            ? `${this.displayName} (${basename(projectPath)})`
-            : this.displayName,
-          sessionId,
-          projectPath,
-          watchPath: fullPath,
+
+        candidates.push({
+          descriptor: {
+            type: this.type,
+            kind: this.kind,
+            displayName: projectPath
+              ? `${this.displayName} (${basename(projectPath)})`
+              : this.displayName,
+            sessionId,
+            projectPath,
+            watchPath: fullPath,
+          },
+          mtimeMs: st.mtimeMs,
         })
-      } else if (depth < 3) {
-        await this.scanDir(fullPath, descriptors, depth + 1)
+      } else if (depth < 4) {
+        await this.scanDir(fullPath, candidates, depth + 1)
       }
     }
   }
@@ -83,12 +107,22 @@ export class CodexAdapter extends BaseAdapter {
     if (!instance.watchPath) return
     const watchPath = instance.watchPath
 
-    // Track file size to know where to start reading
-    let lastSize = 0
+    // Get current file size
     const st = await statSafe(watchPath)
-    if (st) lastSize = st.size
-
+    let lastSize = st?.size ?? 0
     let lastState: AgentState = 'idle'
+
+    // Initial read: process existing content (last 50 lines for state inference)
+    try {
+      const content = await readFile(watchPath, 'utf-8')
+      const lines = content.split('\n')
+      const recentLines = lines.slice(-50)
+      for (const line of recentLines) {
+        if (!line.trim()) continue
+        const parsed = this.parseLine(instance.id, line.trim(), lastState, { replay: true })
+        if (parsed.state) lastState = parsed.state
+      }
+    } catch { /* can't read yet */ }
 
     // Use fs.watch — OS-level file change notification, zero polling
     const watcher = watch(watchPath, { persistent: false }, (eventType) => {
@@ -122,6 +156,10 @@ export class CodexAdapter extends BaseAdapter {
       const timer = this.debounceTimers.get(instance.id)
       if (timer) clearTimeout(timer)
       this.debounceTimers.delete(instance.id)
+      const staleTimer = this.staleTimers.get(instance.id)
+      if (staleTimer) clearTimeout(staleTimer)
+      this.staleTimers.delete(instance.id)
+      this.seenTokenCountLines.delete(instance.id)
     })
   }
 
@@ -133,10 +171,50 @@ export class CodexAdapter extends BaseAdapter {
     instanceId: string,
     line: string,
     lastState: AgentState,
+    options?: { replay?: boolean },
   ): { state: AgentState | null } {
     try {
       const entry = JSON.parse(line)
       const bus = this.ctx.bus
+      const manager = this.ctx.manager
+      const touch = (state: AgentState | null): { state: AgentState | null } => {
+        this.scheduleStaleFallback(instanceId)
+        return { state }
+      }
+      const resetTokenTracking = (): void => {
+        manager.updateCurrentTokenBucket(instanceId, {
+          promptTokens: 0,
+          completionTokens: 0,
+          totalTokens: 0,
+          cachedPromptTokens: 0,
+          reasoningTokens: 0,
+        })
+        this.seenTokenCountLines.delete(instanceId)
+      }
+      const settleCurrentTokens = (reason: string): void => {
+        if (options?.replay) {
+          resetTokenTracking()
+        } else {
+          manager.commitTokenBucket(instanceId, reason)
+          this.seenTokenCountLines.delete(instanceId)
+        }
+      }
+
+      // ── item.* ─────────────────────────────────────────────
+      if (entry.type === 'item.started' && entry.item?.type === 'command_execution') {
+        manager.recordToolCall(instanceId, {
+          name: entry.item.command ?? 'command_execution',
+          input: entry.item.command ?? '',
+          status: 'pending',
+        })
+        manager.updateState(instanceId, 'executing')
+        return touch('executing')
+      }
+
+      if (entry.type === 'item.completed' && entry.item?.type === 'command_execution') {
+        manager.updateState(instanceId, 'thinking')
+        return touch('thinking')
+      }
 
       // ── event_msg ──────────────────────────────────────────
       if (entry.type === 'event_msg') {
@@ -145,54 +223,77 @@ export class CodexAdapter extends BaseAdapter {
 
         switch (payload.type) {
           case 'user_message': {
-            bus.emit({
-              type: 'message',
-              instanceId,
-              timestamp: Date.now(),
-              data: { role: 'user', contentPreview: '(user message)' },
+            manager.recordMessage(instanceId, {
+              role: 'user',
+              content: stringifyContent(payload.content) ?? '(user message)',
             })
             if (lastState !== 'thinking') {
-              this.emitState(instanceId, lastState, 'thinking')
-              return { state: 'thinking' }
+              manager.updateState(instanceId, 'thinking')
+              return touch('thinking')
             }
-            return { state: null }
+            return touch(null)
           }
 
           case 'task_started': {
-            this.emitState(instanceId, lastState, 'thinking')
-            return { state: 'thinking' }
+            if (lastState === 'idle') {
+              resetTokenTracking()
+            }
+            manager.updateState(instanceId, 'thinking')
+            return touch('thinking')
           }
 
           case 'token_count': {
-            if (payload.info) {
-              bus.emit({
-                type: 'token_usage',
-                instanceId,
-                timestamp: Date.now(),
-                data: {
-                  promptTokens: payload.info.input_tokens ?? 0,
-                  completionTokens: payload.info.output_tokens ?? 0,
-                  totalTokens: (payload.info.input_tokens ?? 0) + (payload.info.output_tokens ?? 0),
-                },
-              })
+            const lineKey = line.trim()
+            let seen = this.seenTokenCountLines.get(instanceId)
+            if (!seen) {
+              seen = new Set<string>()
+              this.seenTokenCountLines.set(instanceId, seen)
             }
-            return { state: null }
+            if (seen.has(lineKey)) {
+              return touch(null)
+            }
+            seen.add(lineKey)
+
+            const info = payload.info ?? {}
+            const lastUsage = info.last_token_usage ?? info.total_token_usage ?? info
+            const promptTokens = Number(lastUsage.input_tokens ?? 0)
+            const completionTokens = Number(lastUsage.output_tokens ?? 0)
+            const cachedPromptTokens = Number(lastUsage.cached_input_tokens ?? 0)
+            const reasoningTokens = Number(lastUsage.reasoning_output_tokens ?? 0)
+
+            manager.addCurrentTaskTokens(instanceId, {
+              promptTokens,
+              completionTokens,
+              cachedPromptTokens,
+              reasoningTokens,
+            })
+            return touch(null)
           }
 
           case 'turn_aborted': {
-            this.emitState(instanceId, lastState, 'failed')
-            return { state: 'failed' }
+            manager.updateState(instanceId, 'interrupted')
+            settleCurrentTokens('turn_aborted')
+            return touch('interrupted')
+          }
+
+          case 'patch_apply_end':
+          case 'exec_command_end': {
+            manager.updateState(instanceId, 'thinking')
+            return touch('thinking')
           }
 
           case 'task_complete': {
-            bus.emit({
-              type: 'completed',
-              instanceId,
-              timestamp: Date.now(),
-              data: { reason: 'task_complete' },
-            })
-            this.emitState(instanceId, lastState, 'completed')
-            return { state: 'completed' }
+            if (!options?.replay) {
+              bus.emit({
+                type: 'completed',
+                instanceId,
+                timestamp: Date.now(),
+                data: { reason: 'task_complete' },
+              })
+            }
+            manager.updateState(instanceId, 'idle')
+            settleCurrentTokens('task_complete')
+            return touch('idle')
           }
         }
       }
@@ -200,6 +301,22 @@ export class CodexAdapter extends BaseAdapter {
       // ── response_item ──────────────────────────────────────
       if (entry.type === 'response_item') {
         const payload = entry.payload
+
+        if (payload?.type === 'function_call') {
+          manager.recordToolCall(instanceId, {
+            name: payload.name ?? 'unknown',
+            input: stringifyContent(payload.arguments) ?? JSON.stringify(payload.arguments ?? {}),
+            status: 'pending',
+          })
+          manager.updateState(instanceId, 'executing')
+          return touch('executing')
+        }
+
+        if (payload?.type === 'function_call_output' || payload?.type === 'custom_tool_call_output') {
+          manager.updateState(instanceId, 'thinking')
+          return touch('thinking')
+        }
+
         if (!payload || payload.type !== 'message') return { state: null }
 
         const role = payload.role
@@ -211,11 +328,9 @@ export class CodexAdapter extends BaseAdapter {
             .map((c: { text: string }) => c.text).join('')
 
           if (textContent) {
-            bus.emit({
-              type: 'message',
-              instanceId,
-              timestamp: Date.now(),
-              data: { role: 'assistant', contentPreview: textContent.slice(0, 200) },
+            manager.recordMessage(instanceId, {
+              role: 'assistant',
+              content: textContent,
             })
           }
 
@@ -223,25 +338,34 @@ export class CodexAdapter extends BaseAdapter {
           for (const block of content) {
             if (block.type === 'function_call') {
               hasToolCall = true
-              bus.emit({
-                type: 'tool_call',
-                instanceId,
-                timestamp: Date.now(),
-                data: {
-                  name: block.name ?? 'unknown',
-                  inputPreview: JSON.stringify(block.arguments ?? {}).slice(0, 200),
-                },
+              manager.recordToolCall(instanceId, {
+                name: block.name ?? 'unknown',
+                input: JSON.stringify(block.arguments ?? {}),
+                status: 'pending',
               })
             }
           }
 
-          const newState: AgentState = hasToolCall ? 'executing' : 'thinking'
-          if (newState !== lastState) {
-            this.emitState(instanceId, lastState, newState)
-            return { state: newState }
+          if (hasToolCall && lastState !== 'executing') {
+            manager.updateState(instanceId, 'executing')
+            return touch('executing')
           }
         }
-        return { state: null }
+        return touch(null)
+      }
+
+      if (entry.type === 'turn.completed') {
+        if (!options?.replay) {
+          bus.emit({
+            type: 'completed',
+            instanceId,
+            timestamp: Date.now(),
+            data: { reason: 'turn.completed' },
+          })
+        }
+        manager.updateState(instanceId, 'idle')
+        settleCurrentTokens('turn.completed')
+        return touch('idle')
       }
 
     } catch { /* skip malformed */ }
@@ -249,19 +373,44 @@ export class CodexAdapter extends BaseAdapter {
     return { state: null }
   }
 
-  private emitState(instanceId: string, previous: AgentState, next: AgentState): void {
-    this.ctx.bus.emit({
-      type: 'state_change',
-      instanceId,
-      timestamp: Date.now(),
-      data: {
-        previousState: previous,
-        newState: next,
-        agentType: this.type,
-        agentKind: this.kind,
-      },
-    })
+  private scheduleStaleFallback(instanceId: string): void {
+    const staleTimeoutMs = Number(this.ctx.config?.staleTimeoutMs ?? 30000)
+    const existing = this.staleTimers.get(instanceId)
+    if (existing) clearTimeout(existing)
+
+    if (!Number.isFinite(staleTimeoutMs) || staleTimeoutMs <= 0) return
+
+    const instance = this.ctx.manager.get(instanceId)
+    if (!instance) return
+    if (!['thinking', 'executing'].includes(instance.state)) return
+
+    this.staleTimers.set(instanceId, setTimeout(() => {
+      this.staleTimers.delete(instanceId)
+      const current = this.ctx.manager.get(instanceId)
+      if (!current) return
+      if (!['thinking', 'executing'].includes(current.state)) return
+      this.ctx.manager.updateState(instanceId, 'idle')
+    }, staleTimeoutMs))
   }
+}
+
+function stringifyContent(content: unknown): string | undefined {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === 'string') return part
+        if (part && typeof part === 'object' && 'text' in part) {
+          return typeof (part as { text?: unknown }).text === 'string'
+            ? (part as { text: string }).text
+            : ''
+        }
+        return ''
+      })
+      .filter(Boolean)
+      .join('')
+  }
+  return undefined
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
