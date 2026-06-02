@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import type { EventBus } from './bus.js'
 import type { AgentDescriptor, AgentInstance, AgentState } from './types.js'
 import type { InstanceManager } from './manager.js'
@@ -164,12 +165,34 @@ export class AgentStateController {
         this.updateState(instance, 'waiting_input')
         break
 
-      case 'Stop':
+      case 'Stop': {
         this.updateState(instance, 'completed')
+
+        // Read real agent output tokens from transcript JSONL.
+        // Only count output_tokens (agent's own work), not input_tokens (user prompt).
+        // Subtract already-settled completionTokens to avoid double-counting across Stops.
+        if (instance.watchPath) {
+          try {
+            const totalOutput = readTranscriptOutputTokens(instance.watchPath)
+            const alreadySettled = instance.stats.completionTokens
+            const delta = Math.max(0, totalOutput - alreadySettled)
+            if (delta > 0) {
+              this.manager.updateCurrentTokenBucket(instance.id, {
+                promptTokens: 0,
+                completionTokens: delta,
+                totalTokens: delta,
+              })
+            }
+          } catch {
+            // Transcript read failed — fall back to addCurrentTaskTokens estimates
+          }
+        }
+
         this.manager.commitTokenBucket(instance.id, `${agentType}_stop`)
         instance.hookManaged = false
         this.emitCompleted(instance, `${agentType}_stop`)
         break
+      }
 
       default:
         break
@@ -267,6 +290,27 @@ function outputLooksFailed(value: unknown): boolean {
 /** Rough token estimate: ~4 characters per token for mixed Chinese/English text. */
 function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4))
+}
+
+/** Read transcript JSONL and sum only agent output tokens (not user input). */
+function readTranscriptOutputTokens(filePath: string): number {
+  const content = readFileSync(filePath, 'utf-8')
+  const seen = new Set<string>()
+  let total = 0
+
+  for (const line of content.trim().split('\n')) {
+    try {
+      const entry = JSON.parse(line)
+      if (entry.type !== 'assistant') continue
+      const msg = entry.message
+      if (!msg?.usage?.output_tokens) continue
+      if (!msg.id || seen.has(msg.id)) continue
+      seen.add(msg.id)
+      total += Number(msg.usage.output_tokens)
+    } catch { /* skip */ }
+  }
+
+  return total
 }
 
 function stateFromCodexThreadStatus(status: JsonObject): AgentState {
