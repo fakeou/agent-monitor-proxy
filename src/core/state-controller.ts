@@ -126,9 +126,6 @@ export class AgentStateController {
             role: 'user',
             content: payload.prompt,
           })
-          this.manager.addCurrentTaskTokens(instance.id, {
-            promptTokens: estimateTokens(payload.prompt),
-          })
         }
         this.updateState(instance, 'thinking')
         break

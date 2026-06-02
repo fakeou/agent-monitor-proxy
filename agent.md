@@ -151,11 +151,10 @@ curl http://127.0.0.1:9527/api/events
 
 ## Token 统计
 
-**默认：文本估算，无需额外配置。** Hook 事件自带文本，按 `字符数 / 4` 估算 token。
+**默认：文本估算，无需额外配置。** 统计的是 agent **产出的文本**（`tool_output`），不统计用户输入。按 `字符数 / 4` 估算。
 
 | hook 事件 | 文本 | 累计到 |
 |---|---|---|
-| `UserPromptSubmit` | `prompt` | `promptTokens` |
 | `PostToolUse` | `tool_output` | `completionTokens` |
 
 每次 `Stop` 自动结算：
@@ -171,13 +170,14 @@ currentTaskTokens → commitTokenBucket()
 
 ```
 state_change: idle → thinking           (UserPromptSubmit)
-token_update: promptTokens += 50        (估算 prompt 文本)
 state_change: thinking → executing      (PreToolUse)
 state_change: executing → thinking      (PostToolUse)
-token_update: completionTokens += 30    (估算 tool_output)
+token_update: completionTokens += 30    (估算 tool_output 文本)
 state_change: thinking → completed      (Stop)
-token_usage: { settlementId, settledTokens: { prompt: 50, completion: 30 } }
+token_usage: { settlementId, settledTokens: { completion: 30 } }
 ```
+
+> 注意：hook 无法捕获 agent 的纯文本回复（PreToolUse 和 PostToolUse 之间的思考输出）。如需统计全部 agent 输出 token，启用下方 proxy 模式。
 
 ### 对接计费
 
