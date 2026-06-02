@@ -145,10 +145,15 @@ export class AgentStateController {
           input: preview(payload.tool_input),
           status: outputLooksFailed(payload.tool_output) ? 'error' : 'success',
         })
-        if (typeof payload.tool_output === 'string' && payload.tool_output.trim()) {
-          this.manager.addCurrentTaskTokens(instance.id, {
-            completionTokens: estimateTokens(payload.tool_output),
-          })
+        {
+          const outputText = typeof payload.tool_output === 'string'
+            ? payload.tool_output
+            : payload.tool_output != null ? JSON.stringify(payload.tool_output) : ''
+          if (outputText.trim()) {
+            this.manager.addCurrentTaskTokens(instance.id, {
+              completionTokens: estimateTokens(outputText),
+            })
+          }
         }
         this.updateState(instance, 'thinking')
         break
