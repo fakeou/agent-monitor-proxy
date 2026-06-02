@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs'
 import type { EventBus } from './bus.js'
 import type { AgentDescriptor, AgentInstance, AgentState } from './types.js'
 import type { InstanceManager } from './manager.js'
@@ -163,35 +162,12 @@ export class AgentStateController {
         this.updateState(instance, 'waiting_input')
         break
 
-      case 'Stop': {
+      case 'Stop':
         this.updateState(instance, 'completed')
-
-        // Read real token usage from transcript JSONL and commit only the
-        // delta since last settlement (avoids double-counting across Stops).
-        if (instance.watchPath) {
-          try {
-            const total = readTranscriptTokens(instance.watchPath)
-            const alreadySettled = instance.stats.totalTokens
-            const delta = Math.max(0, total.totalTokens - alreadySettled)
-            if (delta > 0) {
-              // Split delta proportionally between input/output
-              const ratio = total.totalTokens > 0 ? delta / total.totalTokens : 1
-              this.manager.updateCurrentTokenBucket(instance.id, {
-                promptTokens: Math.round(total.inputTokens * ratio),
-                completionTokens: Math.round(total.outputTokens * ratio),
-                totalTokens: delta,
-              })
-            }
-          } catch {
-            // Transcript read failed — fall back to estimates from addCurrentTaskTokens
-          }
-        }
-
         this.manager.commitTokenBucket(instance.id, `${agentType}_stop`)
         instance.hookManaged = false
         this.emitCompleted(instance, `${agentType}_stop`)
         break
-      }
 
       default:
         break
@@ -289,32 +265,6 @@ function outputLooksFailed(value: unknown): boolean {
 /** Rough token estimate: ~4 characters per token for mixed Chinese/English text. */
 function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4))
-}
-
-function readTranscriptTokens(filePath: string): { inputTokens: number; outputTokens: number; totalTokens: number } {
-  const content = readFileSync(filePath, 'utf-8')
-  const lines = content.trim().split('\n')
-  const seen = new Set<string>()
-  let inputTokens = 0
-  let outputTokens = 0
-
-  for (const line of lines) {
-    try {
-      const entry = JSON.parse(line)
-      if (entry.type !== 'assistant') continue
-      const msg = entry.message
-      if (!msg?.usage) continue
-      const msgId = msg.id
-      if (!msgId || seen.has(msgId)) continue
-      seen.add(msgId)
-      inputTokens += Number(msg.usage.input_tokens ?? 0)
-      outputTokens += Number(msg.usage.output_tokens ?? 0)
-    } catch {
-      // Skip unparseable lines
-    }
-  }
-
-  return { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens }
 }
 
 function stateFromCodexThreadStatus(status: JsonObject): AgentState {
