@@ -77,6 +77,7 @@ export class ClaudeCodeAdapter extends BaseAdapter {
     if (!latest) return []
 
     for (const instance of this.ctx.manager.getByType(this.type)) {
+      if (instance.hookManaged) continue
       if (instance.sessionId === latest.descriptor.sessionId) continue
       await this.stopWatching(instance.id)
       this.ctx.manager.unregister(instance.id)

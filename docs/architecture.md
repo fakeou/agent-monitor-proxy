@@ -38,9 +38,9 @@ Agent Monitor Proxy (AMP) is a **local proxy service** that discovers, intercept
 
 ## 2. Design Principles
 
-1. **Zero Intrusion** — Never modify agent code or config. Use environment injection and file observation only.
+1. **Fail-Open Hooks First** — Prefer official hook/app-server/event APIs. Hook failures must not block the agent.
 2. **Horizontal Extensibility** — Adding a new agent = implementing one Adapter interface. No core changes needed.
-3. **Multi-Instance** — Track N instances of the same agent type independently.
+3. **Single Active Session Per Agent Type** — Keep the current active session for each agent type unless a source explicitly supports multiple active sessions.
 4. **Real-Time First** — WebSocket push by default. HTTP polling as fallback.
 5. **Local Only** — No cloud dependency. All data stays on the developer's machine.
 6. **Open Source** — MIT license. Community can contribute adapters.
@@ -76,25 +76,37 @@ Agent → AMP Proxy (localhost:PORT) → api.anthropic.com / api.openai.com
 
 Setup: Set `HTTPS_PROXY` / `HTTP_PROXY` environment variables before launching the agent.
 
-#### 3.2.2 Session File Watcher (Passive)
+#### 3.2.2 Agent Hooks (Primary for CLI Agents)
 
 ```
-Agent writes → ~/.claude/projects/*/sessions/*.jsonl
+Agent hook → scripts/amp-hook.sh → AMP hook endpoint
+                                     │
+                                     ├─ Normalize hook payload
+                                     ├─ Upsert current session
+                                     └─ Emit state/tool/message events
+```
+
+Codex CLI defaults to low-noise hooks: `SessionStart`, `UserPromptSubmit`, and `Stop`.
+Claude Code uses hook events such as `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Notification`, and `Stop`.
+
+#### 3.2.3 App Server / Local Notification Stream (Primary for App Agents)
+
+```
+Codex App server notifications → AMP app event endpoint
+                                      │
+                                      ├─ thread/status/changed
+                                      ├─ turn/started
+                                      └─ turn/completed
+```
+
+#### 3.2.4 Session File Watcher (Auxiliary)
+
+```
+Agent writes → local transcript / JSONL files
                      │
-                     ├─ fs.watch() detects new content
-                     ├─ Tail-read new lines
-                     └─ Parse JSONL → emit events
-```
-
-#### 3.2.3 App Log Watcher (App-specific)
-
-```
-Cursor App → ~/Library/Application Support/Cursor/logs/
-Codex App  → ~/.codex/app-sessions/
-                     │
-                     ├─ Watch log directory
-                     ├─ Parse log entries
-                     └─ Emit events
+                     ├─ Discover session metadata
+                     ├─ Backfill cwd / transcript path
+                     └─ Recover when hooks were not installed
 ```
 
 ### 3.3 Analysis Engine
@@ -110,7 +122,7 @@ Raw API Request/Response
 ├───────────────────┤
 │  Token Counter    │ → Accumulate prompt_tokens, completion_tokens
 ├───────────────────┤
-│  State Machine    │ → Infer: thinking / executing / waiting / completed
+│  State Controller │ → Reduce pushed events into thinking / executing / waiting / completed
 ├───────────────────┤
 │  Instance Manager │ → Track multiple instances, deduplicate
 └───────────────────┘
@@ -177,7 +189,9 @@ GET  /api/instances              → List all tracked instances
 GET  /api/instances/:id          → Get instance detail
 GET  /api/instances/:id/stats    → Get token/message/tool stats
 GET  /api/summary                → Global summary (total tokens, active count, etc.)
-POST /api/instances/:id/action   → Send action (e.g., "inject_message")
+POST /api/hooks/claude-code      → Claude Code hook receiver
+POST /api/hooks/codex            → Codex CLI hook receiver
+POST /api/events/codex-app       → Codex App notification receiver
 GET  /api/events                 → SSE stream (alternative to WebSocket)
 GET  /health                     → Health check
 ```

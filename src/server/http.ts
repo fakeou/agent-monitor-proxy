@@ -9,6 +9,7 @@ import { WebSocketServer, WebSocket } from 'ws'
 import type { InstanceManager } from '../core/manager.js'
 import type { EventBus, EventListener } from '../core/bus.js'
 import type { ServerConfig } from '../core/types.js'
+import { AgentStateController } from '../core/state-controller.js'
 
 export class AMPHttpServer {
   private httpServer: ReturnType<typeof createServer> | null = null
@@ -16,12 +17,14 @@ export class AMPHttpServer {
   private manager: InstanceManager
   private bus: EventBus
   private config: ServerConfig
+  private stateController: AgentStateController
   private unsubscribers: Array<() => void> = []
 
   constructor(manager: InstanceManager, bus: EventBus, config: ServerConfig) {
     this.manager = manager
     this.bus = bus
     this.config = config
+    this.stateController = new AgentStateController(manager, bus)
   }
 
   async start(): Promise<void> {
@@ -106,6 +109,8 @@ export class AMPHttpServer {
         await this.handleClaudeCodeHook(req, res)
       } else if (url.pathname === '/api/hooks/codex' && method === 'POST') {
         await this.handleCodexHook(req, res)
+      } else if (url.pathname === '/api/events/codex-app' && method === 'POST') {
+        await this.handleCodexAppNotification(req, res)
       } else if (url.pathname === '/api/events' && method === 'GET') {
         // Server-Sent Events stream
         this.handleSSE(req, res)
@@ -210,71 +215,8 @@ export class AMPHttpServer {
     const body = await this.readBody(req)
     try {
       const hook = JSON.parse(body)
-      const sessionId = hook.session_id ?? 'unknown'
-      const instanceId = this.buildSessionInstanceId('claude-code', sessionId)
-
-      // Ensure instance exists
-      if (!this.manager.get(instanceId)) {
-        this.manager.register({
-          type: 'claude-code',
-          kind: 'cli',
-          displayName: `Claude Code (${hook.session_id?.slice(0, 8) ?? 'hook'})`,
-          sessionId: hook.session_id,
-          watchPath: hook.transcript_path,
-        })
-      }
-
-      // Parse hook event → state
-      const eventName = hook.hook_event_name
-      let newState: string | null = null
-
-      switch (eventName) {
-        case 'PreToolUse': {
-          newState = 'executing'
-          this.manager.recordToolCall(instanceId, {
-            name: hook.tool_name ?? 'unknown',
-            input: JSON.stringify(hook.tool_input ?? {}).slice(0, 200),
-            status: 'pending',
-          })
-          break
-        }
-        case 'PostToolUse': {
-          newState = 'executing'
-          this.manager.recordToolCall(instanceId, {
-            name: hook.tool_name ?? 'unknown',
-            input: JSON.stringify(hook.tool_input ?? {}).slice(0, 200),
-            status: hook.tool_output?.includes('error') ? 'error' : 'success',
-          })
-          break
-        }
-        case 'Notification': {
-          newState = 'waiting_input'
-          break
-        }
-        case 'Stop': {
-          newState = 'idle'
-          this.bus.emit({
-            type: 'completed',
-            instanceId,
-            timestamp: Date.now(),
-            data: { reason: 'stop', session_id: hook.session_id },
-          })
-          break
-        }
-        case 'SubagentStop': {
-          newState = 'idle'
-          break
-        }
-      }
-
-      if (newState) {
-        const instance = this.manager.get(instanceId)
-        if (instance && instance.state !== newState) {
-          this.manager.updateState(instanceId, newState as import('../core/types.js').AgentState)
-        }
-      }
-
-      this.json(res, { ok: true, event: eventName, instanceId })
+      const instance = this.stateController.handleClaudeHook(hook)
+      this.json(res, { ok: true, event: hook.hook_event_name, instanceId: instance.id })
     } catch (err) {
       this.json(res, { error: 'Invalid hook payload', detail: String(err) }, 400)
     }
@@ -287,13 +229,19 @@ export class AMPHttpServer {
     const body = await this.readBody(req)
     try {
       const hook = JSON.parse(body)
-      this.bus.emit({
-        type: 'message',
-        instanceId: hook.instanceId ?? 'codex-unknown',
-        timestamp: Date.now(),
-        data: hook,
-      })
-      this.json(res, { ok: true })
+      const instance = this.stateController.handleCodexHook(hook)
+      this.json(res, { ok: true, event: hook.hook_event_name, instanceId: instance.id })
+    } catch {
+      this.json(res, { error: 'Invalid payload' }, 400)
+    }
+  }
+
+  private async handleCodexAppNotification(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await this.readBody(req)
+    try {
+      const notification = JSON.parse(body)
+      const instance = this.stateController.handleCodexAppNotification(notification)
+      this.json(res, { ok: true, instanceId: instance?.id })
     } catch {
       this.json(res, { error: 'Invalid payload' }, 400)
     }
@@ -305,11 +253,6 @@ export class AMPHttpServer {
       req.on('data', (chunk) => { body += chunk.toString() })
       req.on('end', () => { resolve(body) })
     })
-  }
-
-  private buildSessionInstanceId(type: string, sessionId: string): string {
-    const suffix = sessionId.length > 20 ? sessionId.slice(-20) : sessionId
-    return `${type}-${suffix}`
   }
 
   // ── Helpers ──────────────────────────────────────────────────

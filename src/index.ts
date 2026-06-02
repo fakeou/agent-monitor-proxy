@@ -90,6 +90,7 @@ export class AgentMonitorProxy {
       this.proxyServer = createProxyServer(
         this.config.proxy,
         this.bus,
+        this.manager,
         this.config.server.proxyPort,
       )
       await this.proxyServer.start()
@@ -186,6 +187,7 @@ if (isMainModule) {
 
 export { EventBus } from './core/bus.js'
 export { InstanceManager } from './core/manager.js'
+export { AgentStateController } from './core/state-controller.js'
 export { AdapterRegistry } from './adapters/registry.js'
 export { BaseAdapter, type AgentAdapter, type AdapterContext } from './adapters/base.js'
 export type * from './core/types.js'

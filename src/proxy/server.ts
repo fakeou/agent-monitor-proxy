@@ -1,16 +1,14 @@
 /**
- * Agent Monitor Proxy — HTTP/HTTPS Proxy Server
+ * Agent Monitor Proxy — HTTP Proxy Server
  *
- * Intercepts API traffic from coding agents.
- * Parses Anthropic, OpenAI, and Google API requests/responses
- * to extract messages, tool calls, and token usage.
+ * Intercepts API requests from coding agents, forwards them to the real API,
+ * and extracts token usage from responses to update instance token buckets.
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { EventBus } from '../core/bus.js'
-import type { ProxyConfig } from '../core/types.js'
-import { parseAnthropicRequest, parseAnthropicResponse } from './parsers/anthropic.js'
-import { parseOpenAIRequest, parseOpenAIResponse } from './parsers/openai.js'
+import type { InstanceManager } from '../core/manager.js'
+import type { ProxyConfig, AgentInstance } from '../core/types.js'
 
 export interface ProxyServer {
   start(): Promise<void>
@@ -18,29 +16,30 @@ export interface ProxyServer {
   getPort(): number
 }
 
-/**
- * Create a proxy server that intercepts API traffic.
- *
- * This is a simplified MITM proxy. In production, you'd want to use
- * a proper HTTP proxy library like `http-mitm-proxy` or `mockttp`.
- * For the MVP, we provide a passthrough proxy that records traffic metadata.
- */
 export function createProxyServer(
   config: ProxyConfig,
   bus: EventBus,
+  manager: InstanceManager,
   port: number,
 ): ProxyServer {
   let server: ReturnType<typeof createServer> | null = null
 
+  const upstream = config.upstream?.replace(/\/+$/, '')
+
   return {
     async start() {
-      server = createServer((req: IncomingMessage, res: ServerResponse) => {
-        handleRequest(req, res, config, bus)
+      server = createServer((req, res) => {
+        handleRequest(req, res, upstream, manager)
       })
 
       return new Promise((resolve) => {
         server!.listen(port, '127.0.0.1', () => {
-          console.log(`[proxy] Listening on 127.0.0.1:${port}`)
+          console.log(`[proxy] Listening on http://127.0.0.1:${port}`)
+          if (upstream) {
+            console.log(`[proxy] Forwarding to ${upstream}`)
+          } else {
+            console.log(`[proxy] No upstream configured — token capture disabled`)
+          }
           resolve()
         })
       })
@@ -63,67 +62,127 @@ export function createProxyServer(
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
-  config: ProxyConfig,
-  bus: EventBus,
+  upstream: string | undefined,
+  manager: InstanceManager,
 ): Promise<void> {
-  const host = req.headers.host ?? ''
-
-  // Check if this is a target host
-  const isTarget = config.targetHosts.some((h) => host.includes(h))
-  if (!isTarget) {
-    res.writeHead(404)
-    res.end('Not a monitored host')
+  // CORS for preflight
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, corsHeaders())
+    res.end()
     return
   }
 
   // Read request body
-  let body = ''
-  for await (const chunk of req) {
-    body += chunk.toString()
+  const body = await readBody(req)
+
+  // No upstream configured — pass through without token tracking
+  if (!upstream) {
+    res.writeHead(200, { ...corsHeaders(), 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ status: 'ok', note: 'proxy running, no upstream configured' }))
+    return
   }
 
-  // Determine which API we're dealing with
-  const isAnthropic = host.includes('anthropic.com')
-  const isOpenAI = host.includes('openai.com')
-  const isGoogle = host.includes('googleapis.com')
+  // Build upstream URL
+  const targetPath = req.url ?? '/'
+  const targetUrl = upstream + targetPath
 
-  // Parse request for metadata
-  let requestMeta: Record<string, unknown> = {}
   try {
-    const parsed = JSON.parse(body)
-    if (isAnthropic) {
-      requestMeta = parseAnthropicRequest(parsed) as unknown as Record<string, unknown>
-    } else if (isOpenAI) {
-      requestMeta = parseOpenAIRequest(parsed) as unknown as Record<string, unknown>
+    // Forward headers (strip hop-by-hop)
+    const fwdHeaders: Record<string, string> = {}
+    for (const [key, val] of Object.entries(req.headers)) {
+      if (!val) continue
+      const lk = key.toLowerCase()
+      if (lk === 'host' || lk === 'connection' || lk === 'transfer-encoding') continue
+      fwdHeaders[key] = Array.isArray(val) ? val[0] : val
     }
-  } catch {
-    // Non-JSON body — skip
+
+    // Forward request to upstream
+    const upstreamRes = await fetch(targetUrl, {
+      method: req.method ?? 'POST',
+      headers: fwdHeaders,
+      body: body || undefined,
+    })
+
+    // Read response body
+    const responseBody = await upstreamRes.text()
+
+    // Extract token usage from response
+    try {
+      const parsed = JSON.parse(responseBody)
+      if (parsed.usage) {
+        const instance = findTargetInstance(manager, body)
+        if (instance) {
+          manager.addCurrentTaskTokens(instance.id, {
+            promptTokens: Number(parsed.usage.input_tokens ?? 0),
+            completionTokens: Number(parsed.usage.output_tokens ?? 0),
+            cachedPromptTokens: Number(parsed.usage.cache_read_input_tokens ?? 0) || undefined,
+            reasoningTokens: Number(parsed.usage.reasoning_output_tokens ?? 0) || undefined,
+          })
+        }
+      }
+    } catch {
+      // Non-JSON response — skip token extraction
+    }
+
+    // Return response to agent
+    const resHeaders: Record<string, string> = { ...corsHeaders() }
+    upstreamRes.headers.forEach((val, key) => {
+      const lk = key.toLowerCase()
+      if (lk === 'transfer-encoding' || lk === 'connection') return
+      resHeaders[key] = val
+    })
+
+    res.writeHead(upstreamRes.status, resHeaders)
+    res.end(responseBody)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Upstream unreachable'
+    res.writeHead(502, { ...corsHeaders(), 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ error: 'proxy_error', detail: message }))
   }
+}
 
-  // Forward to actual API (simplified — in production use a proper HTTP client)
-  const targetHost = host.replace(/:\d+$/, '')
-  const targetPort = isAnthropic ? 443 : isOpenAI ? 443 : 443
+// ── Helpers ──────────────────────────────────────────────────────
 
-  // For MVP: log the interception, don't actually proxy yet
-  // In production, forward the request and parse the response
-  console.log(`[proxy] Intercepted ${req.method} ${host}${req.url}`, {
-    messages: requestMeta.messageCount,
-    model: requestMeta.model,
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve) => {
+    let body = ''
+    req.on('data', (chunk) => { body += chunk.toString() })
+    req.on('end', () => { resolve(body) })
   })
+}
 
-  res.writeHead(200, { 'Content-Type': 'application/json' })
-  res.end(JSON.stringify({ status: 'intercepted', meta: requestMeta }))
+function corsHeaders(): Record<string, string> {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version',
+  }
 }
 
 /**
- * Generate a self-signed CA certificate for HTTPS interception.
- * Returns { cert, key } as PEM strings.
+ * Find the instance to attribute token usage to.
+ * Heuristic: check request body for agent-specific fields,
+ * then return the most recently active instance of that type.
  */
-export async function generateCACert(): Promise<{ cert: string; key: string }> {
-  // In production, use node-forge or similar to generate a real CA cert
-  // For MVP, return placeholder
-  return {
-    cert: 'PLACEHOLDER_CA_CERT',
-    key: 'PLACEHOLDER_CA_KEY',
+function findTargetInstance(manager: InstanceManager, requestBody: string): AgentInstance | undefined {
+  let agentType = 'claude-code'
+
+  try {
+    const parsed = JSON.parse(requestBody)
+    // Anthropic format: has "model" + "messages" + "max_tokens"
+    // OpenAI format: has "model" + "messages" (different structure)
+    // Detect Anthropic by presence of max_tokens or system as top-level field
+    if (parsed.max_tokens !== undefined || parsed.system !== undefined) {
+      agentType = 'claude-code'
+    }
+  } catch {
+    // Can't parse — default to claude-code
   }
+
+  // Find the most recently active instance of this type
+  const instances = manager.getByType(agentType)
+    .filter((i) => i.hookManaged !== false)
+    .sort((a, b) => b.lastActivityAt - a.lastActivityAt)
+
+  return instances[0]
 }

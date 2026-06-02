@@ -1,220 +1,232 @@
-# Agent Monitor Proxy 接入说明
+# Agent Monitor Proxy (AMP)
 
-## 项目定位
+本地 agent 状态与事件层。把 CLI agent 的运行状态统一成一套本地 API。
 
-Agent Monitor Proxy, 简称 AMP, 是一个本地运行的 agent 状态与事件层。它不负责替代 Codex 或 Claude Code, 也不做完整 Dashboard 产品。当前目标是把不同 CLI agent 的运行状态统一成一套本地 API, 方便外部应用读取:
+- **HTTP API**: `http://127.0.0.1:9527`
+- **WebSocket**: `ws://127.0.0.1:9527`
+- **SSE**: `http://127.0.0.1:9527/api/events`
 
-- 当前活跃会话是谁
-- 当前状态是 idle, thinking, executing, waiting_input, interrupted, stopped 等
-- 最近消息和工具调用
-- 当前任务的 token bucket
-- 任务完成或用户中断事件
+## 快速开始
 
-默认服务运行在本机:
-
-- HTTP API: `http://127.0.0.1:9527`
-- WebSocket: `ws://127.0.0.1:9527`
-- SSE: `http://127.0.0.1:9527/api/events`
-- Proxy 预留端口: `127.0.0.1:9528`
-
-## 当前支持的 agent
-
-### Codex CLI
-
-Codex 通过读取 session JSONL 文件接入:
-
-```text
-~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+```bash
+pnpm install
+pnpm dev
 ```
 
-当前只跟踪最新的活跃 Codex session, 避免同一个 Codex 启动出多个重复实例。状态主要从 JSONL 事件推断:
+验证：
 
-- `user_message` / `task_started` -> `thinking`
-- `item.started` 且 `item.type=command_execution` -> `executing`
-- `item.completed` 且 `item.type=command_execution` -> `thinking`
-- `task_complete` / `turn.completed` -> `idle`
-- `turn_aborted` -> `interrupted`
+```bash
+curl http://127.0.0.1:9527/health          # → { "status": "ok" }
+curl http://127.0.0.1:9527/api/instances   # → []
+```
 
-如果 Codex 停在 `thinking` 或 `executing` 后没有后续事件, 会经过 stale fallback 回到 `idle`, 避免 UI 永久卡住。
+## 接入 agent
+
+每个 agent 执行一次安装脚本即可。Hook 脚本会转发事件到 AMP，AMP 没启动也不阻塞 agent（fail-open）。
 
 ### Claude Code
-
-Claude Code 通过 hooks 接入。hook 脚本会把 Claude Code 的事件 POST 到:
-
-```text
-POST /api/hooks/claude-code
-```
-
-安装 hook:
 
 ```bash
 ./scripts/setup-claude-hooks.sh
 ```
 
-当前 Claude Code 的实时状态来自 hook:
+| 事件 | 触发时机 | 状态 |
+|---|---|---|
+| `UserPromptSubmit` | 用户发送消息 | `thinking` |
+| `PreToolUse` | 工具执行前 | `executing` |
+| `PostToolUse` | 工具执行后 | `thinking` |
+| `Notification` | 权限请求 / 通知 | `waiting_input` |
+| `Stop` | 会话结束 | `completed` |
 
-- `PreToolUse` -> `executing`
-- `PostToolUse` -> `executing`
-- `Notification` -> `waiting_input`
-- `Stop` / `SubagentStop` -> `idle`
+### Codex CLI
 
-Claude 的 session JSONL 只用于发现最新会话和项目路径, 不再做历史 token 扫描。
-
-## Token 语义
-
-当前 token 不再表达历史总量, 而是表达当前任务的 token bucket。
-
-每个实例上有:
-
-```ts
-currentTaskTokens: {
-  promptTokens: number
-  completionTokens: number
-  totalTokens: number
-  cachedPromptTokens?: number
-  reasoningTokens?: number
-  updatedAt?: number
-}
+```bash
+./scripts/setup-codex-hooks.sh
 ```
 
-Codex 收到 `token_count` 时, 只更新当前任务 bucket。状态变化事件会带上当前 bucket:
+| 事件 | 触发时机 | 状态 |
+|---|---|---|
+| `SessionStart` | 会话启动 / 恢复 | `idle` |
+| `UserPromptSubmit` | 用户发送消息 | `thinking` |
+| `PreToolUse` | 工具执行前 | `executing` |
+| `PostToolUse` | 工具执行后 | `thinking` |
+| `Notification` | 通知 | `waiting_input` |
+| `Stop` | 会话结束 | `completed` |
+
+### Codex App
+
+```text
+POST /api/events/codex-app
+```
+
+支持 `thread/started`、`thread/status/changed`、`turn/started`、`turn/completed`、`thread/closed`。
+
+### hook 原理
+
+`amp-hook.sh` 是最简单的转发层——读 stdin → curl POST → 结束：
+
+```
+agent 调用 hook → stdin 传入 JSON → POST http://127.0.0.1:9527/api/hooks/<agent>
+```
+
+## 对外 API
+
+### REST
+
+```bash
+# 所有实例
+curl http://127.0.0.1:9527/api/instances
+
+# 单个实例
+curl http://127.0.0.1:9527/api/instances/claude-code-<session-id>
+
+# 全局摘要
+curl http://127.0.0.1:9527/api/summary
+```
+
+返回的实例结构：
 
 ```json
 {
-  "type": "state_change",
-  "data": {
-    "newState": "executing",
-    "currentTaskTokens": {
-      "promptTokens": 100,
-      "completionTokens": 20,
-      "totalTokens": 120
-    }
+  "id": "claude-code-my-session",
+  "type": "claude-code",
+  "displayName": "Claude Code (my-project)",
+  "state": "thinking",
+  "sessionId": "my-session",
+  "projectPath": "/Users/me/my-project",
+  "stats": {
+    "totalTokens": 15000,
+    "promptTokens": 10000,
+    "completionTokens": 5000,
+    "toolCallCount": 12,
+    "messageCount": 8,
+    "requestCount": 5,
+    "durationMs": 120000
+  },
+  "currentTaskTokens": {
+    "promptTokens": 800,
+    "completionTokens": 200,
+    "totalTokens": 1000,
+    "cachedPromptTokens": 400
+  },
+  "session": {
+    "messages": [{ "role": "user", "contentPreview": "...", "timestamp": 1700000000000 }],
+    "toolCalls": [{ "name": "Bash", "inputPreview": "...", "status": "success", "timestamp": 1700000000000 }]
   }
 }
 ```
 
-`token_update` 事件表示当前任务 bucket 的增量变化, 只用于 UI 进度展示, 不能拿来做计费。
-
-任务结束时只发一次 `token_usage`, 然后清空 bucket:
-
-- `task_complete`
-- `turn.completed`
-- `turn_aborted`
-
-用户取消时也会把本次任务 bucket 结算出去, `reason` 为 `turn_aborted`。
-
-如果下游要把 token 换算成虚拟货币, 只能消费 `token_usage.settledTokens`。下游需要按 `settlementId` 去重, 不要把 `token_update` 当作计费源。
-
-## 对外 API
-
-### 获取实例列表
-
-```bash
-curl http://127.0.0.1:9527/api/instances
-```
-
-返回每个实例的当前状态、session 信息、工具调用、消息摘要和 `currentTaskTokens`。
-
-### 获取全局摘要
-
-```bash
-curl http://127.0.0.1:9527/api/summary
-```
-
-摘要包含实例数量、活跃数量、按类型和状态聚合的信息。注意: UI 当前更关注实例上的 `currentTaskTokens`, 不应把历史总 token 当作当前任务 token 使用。
-
-### 订阅 WebSocket
+### WebSocket
 
 ```js
 const ws = new WebSocket('ws://127.0.0.1:9527')
 
-ws.onmessage = (message) => {
-  const event = JSON.parse(message.data)
-  console.log(event.type, event.instanceId, event.data)
+ws.onmessage = (msg) => {
+  const { type, instanceId, timestamp, data } = JSON.parse(msg.data)
+  // 根据 type 处理不同事件
 }
 ```
 
-连接后会先收到一次 `init` 事件, 里面包含当前实例和 summary。之后会收到实时事件。
+连接后先收到 `init`（全量快照），之后实时推送。
 
-### 订阅 SSE
+### SSE
 
 ```bash
 curl http://127.0.0.1:9527/api/events
+# data: {"type":"state_change","instanceId":"...","data":{...}}
 ```
 
-## Debug 面板
+### 事件类型
 
-Debug 面板在 `debug-panel/` 下, 用 Electron 打开:
+| type | data | 说明 |
+|---|---|---|
+| `init` | `{ instances, summary }` | 连接后首次推送，全量快照 |
+| `state_change` | `{ previousState, newState, currentTaskTokens }` | 状态变化 |
+| `message` | `{ role, contentPreview, timestamp }` | 消息记录 |
+| `tool_call` | `{ name, inputPreview, status }` | 工具调用 |
+| `token_update` | `{ updateKind, deltaTokens, currentTaskTokens }` | bucket 变化，UI 展示用 |
+| `token_usage` | `{ settlementId, settledTokens, reason }` | 结算事件，可做计费 |
+| `completed` | `{ reason, session_id }` | 任务完成 |
+| `instance_discovered` / `instance_lost` | `{ type, displayName }` | 实例发现 / 丢失 |
+
+## Token 统计
+
+**默认：文本估算，无需额外配置。** Hook 事件自带文本，按 `字符数 / 4` 估算 token。
+
+| hook 事件 | 文本 | 累计到 |
+|---|---|---|
+| `UserPromptSubmit` | `prompt` | `promptTokens` |
+| `PostToolUse` | `tool_output` | `completionTokens` |
+
+每次 `Stop` 自动结算：
+
+```
+currentTaskTokens → commitTokenBucket()
+                  → stats 累积
+                  → bucket 归零
+                  → 发出 token_usage 事件（带 settlementId）
+```
+
+### 事件流示例
+
+```
+state_change: idle → thinking           (UserPromptSubmit)
+token_update: promptTokens += 50        (估算 prompt 文本)
+state_change: thinking → executing      (PreToolUse)
+state_change: executing → thinking      (PostToolUse)
+token_update: completionTokens += 30    (估算 tool_output)
+state_change: thinking → completed      (Stop)
+token_usage: { settlementId, settledTokens: { prompt: 50, completion: 30 } }
+```
+
+### 对接计费
+
+消费 `token_usage` 事件，按 `settlementId` 去重：
+
+```js
+const seen = new Set()
+ws.onmessage = (msg) => {
+  const event = JSON.parse(msg.data)
+  if (event.type !== 'token_usage') return
+  const { settlementId, settledTokens } = event.data
+  if (seen.has(settlementId)) return
+  seen.add(settlementId)
+  // settledTokens.promptTokens / completionTokens → 扣费
+}
+```
+
+**不要消费 `token_update` 做计费**——它不承诺 exactly-once，只适合 UI 进度展示。
+
+### 精确 token（可选）
+
+如果要用 API 返回的真实 token 数而非估算：
 
 ```bash
-cd debug-panel
-npm run start
+AMP_UPSTREAM_URL="https://api.deepseek.com/anthropic" pnpm dev
 ```
 
-面板会连接 `ws://127.0.0.1:9527`, 并通过 HTTP 拉取实例列表和 summary。当前面板里的 token 展示是当前任务 bucket, 不是历史总量。
+然后把 Claude Code 的 `ANTHROPIC_BASE_URL` 改为 `http://127.0.0.1:9528`。Proxy 会转发请求并从响应 `usage` 中提取精确 token。
 
-## 本地开发
+## 新增 agent
 
-安装依赖:
-
-```bash
-pnpm install
-```
-
-启动 AMP:
-
-```bash
-pnpm dev
-```
-
-验证:
-
-```bash
-pnpm test
-pnpm typecheck
-pnpm build
-```
-
-常用调试命令:
-
-```bash
-curl http://127.0.0.1:9527/health
-curl http://127.0.0.1:9527/api/instances
-curl http://127.0.0.1:9527/api/summary
-```
-
-## 新 agent 如何接入
-
-新增 agent 通常实现一个 adapter, 继承 `BaseAdapter`:
+实现 adapter 继承 `BaseAdapter`，再在 `AgentStateController` 处理状态映射：
 
 ```ts
-export class MyAgentAdapter extends BaseAdapter {
+class MyAdapter extends BaseAdapter {
   readonly type = 'my-agent'
   readonly kind = 'cli' as const
   readonly displayName = 'My Agent'
 
-  async discover() {
-    return []
-  }
-
-  async startWatching(instance) {
-    // 监听 session 文件、hook、socket 或其它本地事件源
-  }
+  async discover() { return [] }
+  async startWatching(instance) { /* 监听 hook 或文件 */ }
 }
 ```
 
-接入时优先回答三个问题:
-
-1. 如何稳定发现当前活跃会话?
-2. 哪些事件能可靠映射到 `thinking` / `executing` / `idle` / `interrupted`?
-3. token 是否能按当前任务结算? 如果只能拿历史总量, 不要接入为当前任务 token。
-
-状态变化应通过 `InstanceManager.updateState()` 写入。消息、工具调用和 token bucket 应通过 `InstanceManager` 的对应方法写入, 避免 adapter 直接绕过 manager 发统计事件。
+hook 转发脚本就是 `amp-hook.sh` 的模式：stdin → curl → AMP。
 
 ## 设计原则
 
-- 本地优先, 不依赖云服务。
-- 只做状态和事件层, 不把 UI 或业务逻辑塞进核心。
-- 当前只保留最新活跃 session, 尽量避免重复实例。
-- token 以当前任务 bucket 为准, 完成或中断时结算一次。
-- 无法准确实时获取的数据宁可不报, 不用历史扫描伪装实时数据。
+- 本地优先，不依赖云服务
+- hook 优先于文件扫描——hook 管理的实例 discovery 不触碰
+- 只做状态和事件层，UI 由外部消费者负责
+- token 按任务结算，不伪造历史数据

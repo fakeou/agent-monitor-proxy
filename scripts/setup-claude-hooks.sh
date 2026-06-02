@@ -1,20 +1,10 @@
 #!/bin/bash
-# Agent Monitor Proxy — Claude Code Hook Setup
+# AMP — Claude Code Hook Installer
 #
-# This script configures Claude Code to send events to AMP.
-#
-# Usage:
-#   ./scripts/setup-claude-hooks.sh
-#
-# What it does:
-#   1. Creates ~/.claude/hooks/ directory
-#   2. Copies amp-hook.sh to ~/.claude/hooks/
-#   3. Makes it executable
-#   4. Updates ~/.claude/settings.json to configure hooks
-#
-# After running this, Claude Code will automatically send events to AMP.
+# Installs the AMP hook bridge into ~/.claude/settings.json.
+# Safely merges with existing settings — never overwrites env, model, or other keys.
 
-set -e
+set -euo pipefail
 
 CLAUDE_DIR="$HOME/.claude"
 HOOKS_DIR="$CLAUDE_DIR/hooks"
@@ -22,98 +12,83 @@ SETTINGS_FILE="$CLAUDE_DIR/settings.json"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOK_SOURCE="$SCRIPT_DIR/amp-hook.sh"
 HOOK_TARGET="$HOOKS_DIR/amp-hook.sh"
-AMP_URL="${AMP_URL:-http://127.0.0.1:9527/api/hooks/claude-code}"
 
-# 1. Create hooks directory
+echo "==> Installing AMP hook bridge for Claude Code..."
+
 mkdir -p "$HOOKS_DIR"
-
-# 2. Copy and make executable
 cp "$HOOK_SOURCE" "$HOOK_TARGET"
 chmod +x "$HOOK_TARGET"
 
-# 3. Update settings.json
-if [ -f "$SETTINGS_FILE" ]; then
-    # Merge with existing settings
-    python3 -c "
-import json
-import sys
+python3 - "$SETTINGS_FILE" "$HOOK_TARGET" <<'PY'
+import json, sys
 
-with open('$SETTINGS_FILE', 'r') as f:
-    settings = json.load(f)
+settings_path = sys.argv[1]
+hook_command = sys.argv[2]
 
-# Add hook configuration
-if 'hooks' not in settings:
-    settings['hooks'] = {}
+# Read existing settings or start fresh
+if settings_path.endswith('.json'):
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        settings = {}
+else:
+    settings = {}
 
-hook_config = [
-    {
-        'type': 'command',
-        'command': '$HOOK_TARGET'
-    }
-]
+if not isinstance(settings, dict):
+    settings = {}
 
-settings['hooks']['PreToolUse'] = hook_config
-settings['hooks']['PostToolUse'] = hook_config
-settings['hooks']['Notification'] = hook_config
-settings['hooks']['Stop'] = hook_config
-settings['hooks']['SubagentStop'] = hook_config
+# Events we care about
+events = ['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Notification', 'Stop']
 
-with open('$SETTINGS_FILE', 'w') as f:
-    json.dump(settings, f, indent=2)
+# Existing hooks or fresh dict
+hooks = settings.get('hooks')
+if not isinstance(hooks, dict):
+    hooks = {}
 
-print('Updated settings.json with hook configuration')
-"
-else
-    # Create new settings file
-    cat > "$SETTINGS_FILE" << EOF
-{
-    "hooks": {
-        "PreToolUse": [
-            {
-                "type": "command",
-                "command": "$HOOK_TARGET"
-            }
-        ],
-        "PostToolUse": [
-            {
-                "type": "command",
-                "command": "$HOOK_TARGET"
-            }
-        ],
-        "Notification": [
-            {
-                "type": "command",
-                "command": "$HOOK_TARGET"
-            }
-        ],
-        "Stop": [
-            {
-                "type": "command",
-                "command": "$HOOK_TARGET"
-            }
-        ],
-        "SubagentStop": [
-            {
-                "type": "command",
-                "command": "$HOOK_TARGET"
-            }
+for event_name in events:
+    groups = hooks.get(event_name)
+    if not isinstance(groups, list):
+        groups = []
+
+    # Remove any existing AMP hook from this event (dedup)
+    cleaned = []
+    for group in groups:
+        group_hooks = group.get('hooks') if isinstance(group, dict) else None
+        if not isinstance(group_hooks, list):
+            cleaned.append(group)
+            continue
+        remaining = [
+            h for h in group_hooks
+            if not (isinstance(h, dict) and 'amp-hook.sh' in h.get('command', ''))
         ]
-    }
-}
-EOF
-    echo "Created settings.json with hook configuration"
-fi
+        if remaining:
+            new_group = dict(group)
+            new_group['hooks'] = remaining
+            cleaned.append(new_group)
+
+    # Append our hook group
+    cleaned.append({
+        'hooks': [{
+            'type': 'command',
+            'command': hook_command,
+            'timeout': hook_command.endswith('amp-hook.sh') and 45 or 45,
+        }]
+    })
+    hooks[event_name] = cleaned
+
+settings['hooks'] = hooks
+
+with open(settings_path, 'w') as f:
+    json.dump(settings, f, indent=2)
+    f.write('\n')
+
+print(f"Updated {settings_path} ({len(events)} hook events)")
+PY
 
 echo ""
-echo "✅ Claude Code hooks configured!"
-echo ""
-echo "Hook script: $HOOK_TARGET"
-echo "Settings: $SETTINGS_FILE"
-echo ""
-echo "Claude Code will now send events to AMP when:"
-echo "  - PreToolUse: Before using a tool"
-echo "  - PostToolUse: After using a tool"
-echo "  - Notification: When a notification occurs"
-echo "  - Stop: When the session stops"
-echo "  - SubagentStop: When a subagent stops"
-echo "Forward target: $AMP_URL"
+echo "Claude Code hooks installed:"
+echo "  Hook script : $HOOK_TARGET"
+echo "  Settings    : $SETTINGS_FILE"
+echo "  Events      : UserPromptSubmit PreToolUse PostToolUse Notification Stop"
+echo "  Target      : http://127.0.0.1:9527/api/hooks/claude-code"

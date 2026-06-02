@@ -19,10 +19,15 @@
 import { readdir, readFile, stat } from 'node:fs/promises'
 import { watch, type FSWatcher } from 'node:fs'
 import { join, basename } from 'node:path'
-import type { AgentDescriptor, AgentInstance, AgentState } from '../core/types.js'
+import type { AgentDescriptor, AgentInstance, AgentState, TokenBucket } from '../core/types.js'
 import { BaseAdapter } from './base.js'
 
 const SESSION_ACTIVE_WINDOW_MS = 12 * 60 * 60 * 1000
+
+type CodexParseResult = {
+  state: AgentState | null
+  terminal?: { reason: string; settlementKey: string }
+}
 
 export class CodexAdapter extends BaseAdapter {
   readonly type = 'codex'
@@ -41,7 +46,7 @@ export class CodexAdapter extends BaseAdapter {
   }
 
   async discover(): Promise<AgentDescriptor[]> {
-    const candidates: Array<{ descriptor: AgentDescriptor; mtimeMs: number }> = []
+    const candidates: CodexSessionCandidate[] = []
     try {
       const sessionsDir = join(this.sessionDir, 'sessions')
       await this.scanDir(sessionsDir, candidates, 0)
@@ -49,12 +54,13 @@ export class CodexAdapter extends BaseAdapter {
       // ~/.codex doesn't exist
     }
 
-    const latest = candidates.sort((a, b) => b.mtimeMs - a.mtimeMs)[0]
+    const latest = candidates.sort((a, b) => b.createdAtMs - a.createdAtMs || b.mtimeMs - a.mtimeMs)[0]
     if (!latest) {
       return []
     }
 
     for (const instance of this.ctx.manager.getByType(this.type)) {
+      if (instance.hookManaged) continue
       if (instance.sessionId === latest.descriptor.sessionId) continue
       await this.stopWatching(instance.id)
       this.ctx.manager.unregister(instance.id)
@@ -65,7 +71,7 @@ export class CodexAdapter extends BaseAdapter {
 
   private async scanDir(
     dir: string,
-    candidates: Array<{ descriptor: AgentDescriptor; mtimeMs: number }>,
+    candidates: CodexSessionCandidate[],
     depth: number,
   ): Promise<void> {
     if (depth > 5) return
@@ -82,7 +88,8 @@ export class CodexAdapter extends BaseAdapter {
         }
 
         const sessionId = entry.replace('.jsonl', '')
-        const projectPath = await extractProjectPath(fullPath)
+        const meta = await extractSessionMeta(fullPath)
+        const projectPath = meta.projectPath
 
         candidates.push({
           descriptor: {
@@ -96,6 +103,7 @@ export class CodexAdapter extends BaseAdapter {
             watchPath: fullPath,
           },
           mtimeMs: st.mtimeMs,
+          createdAtMs: meta.createdAtMs ?? st.birthtimeMs ?? st.mtimeMs,
         })
       } else if (depth < 4) {
         await this.scanDir(fullPath, candidates, depth + 1)
@@ -111,6 +119,8 @@ export class CodexAdapter extends BaseAdapter {
     const st = await statSafe(watchPath)
     let lastSize = st?.size ?? 0
     let lastState: AgentState = 'idle'
+    let pendingLine = ''
+    let replayedTerminal: { reason: string; settlementKey: string } | null = null
 
     // Initial read: process existing content (last 50 lines for state inference)
     try {
@@ -119,8 +129,14 @@ export class CodexAdapter extends BaseAdapter {
       const recentLines = lines.slice(-50)
       for (const line of recentLines) {
         if (!line.trim()) continue
-        const parsed = this.parseLine(instance.id, line.trim(), lastState, { replay: true })
+        const parsed = this.parseLine(instance.id, line.trim(), lastState, { replay: true, collectReplayTokens: true })
         if (parsed.state) lastState = parsed.state
+        if (parsed.terminal) replayedTerminal = parsed.terminal
+      }
+      if (replayedTerminal) {
+        this.ctx.manager.commitTokenBucket(instance.id, replayedTerminal.reason, {
+          settlementKey: replayedTerminal.settlementKey,
+        })
       }
     } catch { /* can't read yet */ }
 
@@ -138,10 +154,18 @@ export class CodexAdapter extends BaseAdapter {
         const currentStat = await statSafe(watchPath)
         if (!currentStat || currentStat.size <= lastSize) return
 
+        if (currentStat.size < lastSize) {
+          lastSize = 0
+          pendingLine = ''
+        }
+
         const newContent = await readFileFromOffset(watchPath, lastSize)
         lastSize = currentStat.size
 
-        for (const line of newContent.split('\n')) {
+        const lines = (pendingLine + newContent).split('\n')
+        pendingLine = lines.pop() ?? ''
+
+        for (const line of lines) {
           if (!line.trim()) continue
           const parsed = this.parseLine(instance.id, line.trim(), lastState)
           if (parsed.state) lastState = parsed.state
@@ -171,13 +195,13 @@ export class CodexAdapter extends BaseAdapter {
     instanceId: string,
     line: string,
     lastState: AgentState,
-    options?: { replay?: boolean },
-  ): { state: AgentState | null } {
+    options?: { replay?: boolean; collectReplayTokens?: boolean },
+  ): CodexParseResult {
     try {
       const entry = JSON.parse(line)
       const bus = this.ctx.bus
       const manager = this.ctx.manager
-      const touch = (state: AgentState | null): { state: AgentState | null } => {
+      const touch = (state: AgentState | null): CodexParseResult => {
         this.scheduleStaleFallback(instanceId)
         return { state }
       }
@@ -193,11 +217,20 @@ export class CodexAdapter extends BaseAdapter {
       }
       const settleCurrentTokens = (reason: string): void => {
         if (options?.replay) {
-          resetTokenTracking()
+          if (!options.collectReplayTokens) {
+            resetTokenTracking()
+          }
         } else {
-          manager.commitTokenBucket(instanceId, reason)
+          manager.commitTokenBucket(instanceId, reason, { settlementKey: getSettlementKey(entry) })
           this.seenTokenCountLines.delete(instanceId)
         }
+      }
+      const applyUsageIfBucketEmpty = (usage: unknown): void => {
+        const current = manager.get(instanceId)?.currentTaskTokens
+        if (!usage || current?.totalTokens) return
+        const bucket = usageToTokenBucket(usage)
+        if (bucket.totalTokens <= 0) return
+        manager.updateCurrentTokenBucket(instanceId, bucket)
       }
 
       // ── item.* ─────────────────────────────────────────────
@@ -273,7 +306,11 @@ export class CodexAdapter extends BaseAdapter {
           case 'turn_aborted': {
             manager.updateState(instanceId, 'interrupted')
             settleCurrentTokens('turn_aborted')
-            return touch('interrupted')
+            const result = touch('interrupted')
+            if (options?.replay && options.collectReplayTokens) {
+              result.terminal = { reason: 'turn_aborted', settlementKey: getSettlementKey(entry) }
+            }
+            return result
           }
 
           case 'patch_apply_end':
@@ -293,7 +330,11 @@ export class CodexAdapter extends BaseAdapter {
             }
             manager.updateState(instanceId, 'idle')
             settleCurrentTokens('task_complete')
-            return touch('idle')
+            const result = touch('idle')
+            if (options?.replay && options.collectReplayTokens) {
+              result.terminal = { reason: 'task_complete', settlementKey: getSettlementKey(entry) }
+            }
+            return result
           }
         }
       }
@@ -355,6 +396,7 @@ export class CodexAdapter extends BaseAdapter {
       }
 
       if (entry.type === 'turn.completed') {
+        applyUsageIfBucketEmpty(entry.usage)
         if (!options?.replay) {
           bus.emit({
             type: 'completed',
@@ -365,7 +407,11 @@ export class CodexAdapter extends BaseAdapter {
         }
         manager.updateState(instanceId, 'idle')
         settleCurrentTokens('turn.completed')
-        return touch('idle')
+        const result = touch('idle')
+        if (options?.replay && options.collectReplayTokens) {
+          result.terminal = { reason: 'turn.completed', settlementKey: getSettlementKey(entry) }
+        }
+        return result
       }
 
     } catch { /* skip malformed */ }
@@ -419,10 +465,20 @@ async function readdirSafe(dir: string): Promise<string[]> {
   try { return await readdir(dir) } catch { return [] }
 }
 
-async function statSafe(path: string): Promise<{ size: number; mtimeMs: number } | null> {
+interface CodexSessionCandidate {
+  descriptor: AgentDescriptor
+  mtimeMs: number
+  createdAtMs: number
+}
+
+async function statSafe(path: string): Promise<{ size: number; mtimeMs: number; birthtimeMs: number } | null> {
   try {
     const s = await stat(path)
-    return { size: Number(s.size), mtimeMs: Number(s.mtimeMs) }
+    return {
+      size: Number(s.size),
+      mtimeMs: Number(s.mtimeMs),
+      birthtimeMs: Number(s.birthtimeMs),
+    }
   } catch { return null }
 }
 
@@ -431,7 +487,10 @@ async function readFileFromOffset(path: string, offset: number): Promise<string>
   return content.slice(offset)
 }
 
-async function extractProjectPath(sessionPath: string): Promise<string | undefined> {
+async function extractSessionMeta(sessionPath: string): Promise<{
+  projectPath?: string
+  createdAtMs?: number
+}> {
   try {
     const content = await readFile(sessionPath, 'utf-8')
     const lines = content.split('\n').slice(0, 5)
@@ -439,10 +498,51 @@ async function extractProjectPath(sessionPath: string): Promise<string | undefin
       try {
         const entry = JSON.parse(line)
         if (entry.type === 'session_meta' && entry.payload?.cwd) {
-          return entry.payload.cwd
+          const createdAtMs = Date.parse(entry.payload.timestamp ?? '')
+          return {
+            projectPath: entry.payload.cwd,
+            createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : undefined,
+          }
         }
       } catch { /* skip */ }
     }
   } catch { /* skip */ }
-  return undefined
+  return {}
+}
+
+function usageToTokenBucket(usage: unknown): TokenBucket {
+  if (!usage || typeof usage !== 'object') {
+    return {
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+    }
+  }
+  const raw = usage as Record<string, unknown>
+  const promptTokens = Number(raw.input_tokens ?? 0)
+  const completionTokens = Number(raw.output_tokens ?? 0)
+  const cachedPromptTokens = Number(raw.cached_input_tokens ?? 0)
+  const reasoningTokens = Number(raw.reasoning_output_tokens ?? 0)
+  return {
+    promptTokens: Number.isFinite(promptTokens) ? promptTokens : 0,
+    completionTokens: Number.isFinite(completionTokens) ? completionTokens : 0,
+    totalTokens: (Number.isFinite(promptTokens) ? promptTokens : 0)
+      + (Number.isFinite(completionTokens) ? completionTokens : 0),
+    cachedPromptTokens: Number.isFinite(cachedPromptTokens) ? cachedPromptTokens : 0,
+    reasoningTokens: Number.isFinite(reasoningTokens) ? reasoningTokens : 0,
+  }
+}
+
+function getSettlementKey(entry: unknown): string {
+  if (!entry || typeof entry !== 'object') return String(Date.now())
+  const raw = entry as Record<string, unknown>
+  const payload = raw.payload && typeof raw.payload === 'object'
+    ? raw.payload as Record<string, unknown>
+    : undefined
+  const turnId = payload?.turn_id ?? raw.turn_id
+  if (typeof turnId === 'string' && turnId) return turnId
+  const timestamp = raw.timestamp ?? payload?.completed_at
+  if (typeof timestamp === 'string' && timestamp) return timestamp
+  if (typeof timestamp === 'number' && Number.isFinite(timestamp)) return String(timestamp)
+  return String(Date.now())
 }

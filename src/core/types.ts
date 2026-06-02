@@ -58,6 +58,9 @@ export interface AgentInstance {
   discoveredAt: number
   /** Last time we received data from this instance */
   lastActivityAt: number
+
+  /** When true, discovery must not unregister this instance — hooks own it */
+  hookManaged?: boolean
 }
 
 export interface AgentStats {
@@ -246,7 +249,8 @@ export interface DiscoveryConfig {
 
 export interface ProxyConfig {
   enabled: boolean
-  targetHosts: string[]
+  /** Base URL to forward API requests to (e.g. https://api.anthropic.com) */
+  upstream?: string
   recordRequestBody: boolean
   recordResponseBody: boolean
 }
@@ -279,11 +283,7 @@ export const DEFAULT_CONFIG: AMPConfig = {
   },
   proxy: {
     enabled: true,
-    targetHosts: [
-      'api.anthropic.com',
-      'api.openai.com',
-      'generativelanguage.googleapis.com',
-    ],
+    upstream: process.env.AMP_UPSTREAM_URL || undefined,
     recordRequestBody: true,
     recordResponseBody: true,
   },

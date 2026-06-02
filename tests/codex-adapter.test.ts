@@ -497,6 +497,147 @@ describe('CodexAdapter', () => {
     expect(manager.get(instance.id)?.state).toBe('idle')
   })
 
+  test('buffers partial codex JSONL writes before parsing', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'amp-codex-partial-'))
+    const home = join(root, '.codex')
+    const sessionDir = join(home, 'sessions', '2026', '06', '02')
+    await mkdir(sessionDir, { recursive: true })
+    const sessionPath = join(sessionDir, 'rollout-2026-06-02T12-00-00-partial.jsonl')
+    await writeFile(sessionPath, [
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: 'rollout-2026-06-02T12-00-00-partial',
+          cwd: '/tmp/partial',
+          timestamp: '2026-06-02T12:00:00.000Z',
+        },
+      }),
+      '',
+    ].join('\n'))
+
+    const bus = new EventBus()
+    const manager = new InstanceManager(bus)
+    const adapter = new CodexAdapter()
+    await adapter.init({
+      bus,
+      manager,
+      config: {},
+      homeDir: root,
+    })
+
+    const [descriptor] = await adapter.discover()
+    const instance = manager.register(descriptor!)
+    await adapter.startWatching(instance)
+
+    const tokenLine = JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          last_token_usage: {
+            input_tokens: 100,
+            output_tokens: 20,
+            total_tokens: 120,
+          },
+        },
+      },
+    })
+    const completeLine = JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete' } })
+
+    await appendFile(sessionPath, `${tokenLine}\n${completeLine.slice(0, 20)}`)
+    await new Promise((resolve) => setTimeout(resolve, 350))
+    expect(bus.getHistory({ type: 'token_usage' })).toHaveLength(0)
+
+    await appendFile(sessionPath, `${completeLine.slice(20)}\n`)
+    await new Promise((resolve) => setTimeout(resolve, 350))
+
+    const tokenEvents = bus.getHistory({ type: 'token_usage' })
+    expect(tokenEvents).toHaveLength(1)
+    expect(tokenEvents[0]?.data).toMatchObject({
+      settledTokens: {
+        promptTokens: 100,
+        completionTokens: 20,
+        totalTokens: 120,
+      },
+      reason: 'task_complete',
+    })
+    expect(manager.get(instance.id)?.currentTaskTokens.totalTokens).toBe(0)
+
+    await adapter.stopWatching(instance.id)
+  })
+
+  test('settles a just-completed codex session discovered after the task finished', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'amp-codex-completed-before-watch-'))
+    const home = join(root, '.codex')
+    const sessionDir = join(home, 'sessions', '2026', '06', '02')
+    await mkdir(sessionDir, { recursive: true })
+    const sessionPath = join(sessionDir, 'rollout-2026-06-02T12-10-00-completed.jsonl')
+    await writeFile(sessionPath, [
+      JSON.stringify({
+        timestamp: '2026-06-02T12:10:00.000Z',
+        type: 'session_meta',
+        payload: {
+          id: 'rollout-2026-06-02T12-10-00-completed',
+          cwd: '/tmp/completed-before-watch',
+          timestamp: '2026-06-02T12:10:00.000Z',
+        },
+      }),
+      JSON.stringify({ timestamp: '2026-06-02T12:10:01.000Z', type: 'event_msg', payload: { type: 'task_started' } }),
+      JSON.stringify({
+        timestamp: '2026-06-02T12:10:02.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            last_token_usage: {
+              input_tokens: 200,
+              output_tokens: 30,
+              total_tokens: 230,
+            },
+          },
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-06-02T12:10:03.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          turn_id: 'turn-completed-before-watch',
+        },
+      }),
+      '',
+    ].join('\n'))
+
+    const bus = new EventBus()
+    const manager = new InstanceManager(bus)
+    const adapter = new CodexAdapter()
+    await adapter.init({
+      bus,
+      manager,
+      config: {},
+      homeDir: root,
+    })
+
+    const [descriptor] = await adapter.discover()
+    const instance = manager.register(descriptor!)
+    await adapter.startWatching(instance)
+
+    const tokenEvents = bus.getHistory({ type: 'token_usage' })
+    expect(tokenEvents).toHaveLength(1)
+    expect(tokenEvents[0]?.data).toMatchObject({
+      settlementId: `${instance.id}:task_complete:turn-completed-before-watch`,
+      settledTokens: {
+        promptTokens: 200,
+        completionTokens: 30,
+        totalTokens: 230,
+      },
+      reason: 'task_complete',
+    })
+    expect(manager.get(instance.id)?.currentTaskTokens.totalTokens).toBe(0)
+
+    await adapter.stopWatching(instance.id)
+  })
+
   test('assistant messages do not force a completed turn back to thinking', () => {
     const bus = new EventBus()
     const manager = new InstanceManager(bus)
@@ -587,6 +728,115 @@ describe('CodexAdapter', () => {
     expect(descriptors).toHaveLength(1)
     expect(descriptors[0]?.sessionId).toBe('rollout-new')
     expect(manager.get(oldInstance.id)).toBeUndefined()
+  })
+
+  test('discovers the newest codex session by session creation time, not mtime', async () => {
+    const bus = new EventBus()
+    const manager = new InstanceManager(bus)
+    const adapter = new CodexAdapter()
+    const homeDir = await mkdtemp(join(tmpdir(), 'amp-codex-created-at-'))
+    const sessionDir = join(homeDir, '.codex', 'sessions', '2026', '06', '01')
+
+    await adapter.init({
+      bus,
+      manager,
+      config: { enabled: true },
+      homeDir,
+    })
+
+    await mkdir(sessionDir, { recursive: true })
+    const oldLongRunningSession = join(sessionDir, 'rollout-old-long-running.jsonl')
+    const newShortSession = join(sessionDir, 'rollout-new-short.jsonl')
+    await writeFile(
+      oldLongRunningSession,
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          timestamp: '2026-06-01T10:08:59.146Z',
+          cwd: '/tmp/project',
+        },
+      }) + '\n',
+    )
+    await writeFile(
+      newShortSession,
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          timestamp: '2026-06-01T14:43:20.357Z',
+          cwd: '/tmp/project',
+        },
+      }) + '\n',
+    )
+
+    await utimes(oldLongRunningSession, new Date(), new Date())
+    await utimes(
+      newShortSession,
+      new Date(Date.now() - 60_000),
+      new Date(Date.now() - 60_000),
+    )
+
+    const descriptors = await adapter.discover()
+
+    expect(descriptors).toHaveLength(1)
+    expect(descriptors[0]?.sessionId).toBe('rollout-new-short')
+  })
+
+  test('settles turn.completed usage when no token_count was observed', () => {
+    const bus = new EventBus()
+    const manager = new InstanceManager(bus)
+    const adapter = new CodexAdapter()
+
+    ;(adapter as unknown as { ctx: { bus: EventBus; manager: InstanceManager } }).ctx = { bus, manager }
+
+    const instance = manager.register({
+      type: 'codex',
+      kind: 'cli',
+      displayName: 'Codex CLI',
+      sessionId: '019e82a8-76f6-7432-8abd-d79880f4cc80',
+    })
+
+    const result = (adapter as unknown as {
+      parseLine: (id: string, line: string, lastState: string) => { state: string | null }
+    }).parseLine(
+      instance.id,
+      JSON.stringify({
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 100,
+          cached_input_tokens: 40,
+          output_tokens: 12,
+          reasoning_output_tokens: 5,
+        },
+      }),
+      'thinking',
+    )
+
+    expect(result.state).toBe('idle')
+    expect(bus.getHistory({ type: 'token_usage' })).toHaveLength(1)
+    expect(bus.getHistory({ type: 'token_usage' })[0]?.data).toMatchObject({
+      settlementId: expect.any(String),
+      settledTokens: {
+        promptTokens: 100,
+        completionTokens: 12,
+        totalTokens: 112,
+        cachedPromptTokens: 40,
+        reasoningTokens: 5,
+      },
+      reason: 'turn.completed',
+    })
+    expect(bus.getHistory({ type: 'token_update' })[0]?.data).toMatchObject({
+      updateKind: 'reset',
+      deltaTokens: {
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+      },
+      currentTaskTokens: {
+        promptTokens: 100,
+        completionTokens: 12,
+        totalTokens: 112,
+      },
+    })
   })
 
   test('stale active codex sessions fall back to idle', async () => {

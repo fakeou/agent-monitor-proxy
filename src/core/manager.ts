@@ -216,7 +216,7 @@ export class InstanceManager {
   commitTokenBucket(
     instanceId: string,
     reason: string,
-    options?: { model?: string; requestId?: string },
+    options?: { model?: string; requestId?: string; settlementKey?: string },
   ): TokenBucket | null {
     const instance = this.instances.get(instanceId)
     if (!instance) return null
@@ -237,7 +237,7 @@ export class InstanceManager {
       instanceId,
       timestamp: Date.now(),
       data: {
-        settlementId: `${instanceId}:${reason}:${snapshot.updatedAt ?? Date.now()}`,
+        settlementId: `${instanceId}:${reason}:${options?.settlementKey ?? snapshot.updatedAt ?? Date.now()}`,
         settledTokens: snapshot,
         model: options?.model,
         requestId: options?.requestId,
@@ -340,7 +340,7 @@ export class InstanceManager {
       timestamp: Date.now(),
       data: {
         updateKind: 'reset',
-        deltaTokens: { ...instance.currentTaskTokens },
+        deltaTokens: createEmptyTokenBucket(),
         currentTaskTokens: { ...instance.currentTaskTokens },
       },
     })
