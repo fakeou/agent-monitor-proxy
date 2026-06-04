@@ -101,7 +101,7 @@ describe('Claude Code hook endpoint', () => {
 
     expect(response.status).toBe(200)
     const instance = manager.getByType('codex')[0]
-    expect(instance?.state).toBe('thinking')
+    expect(instance?.state).toBe('task_start')
     expect(instance?.projectPath).toBe('/tmp/codex-http')
   })
 

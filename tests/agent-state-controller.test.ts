@@ -37,7 +37,7 @@ describe('AgentStateController', () => {
     const active = manager.getByType('codex')
     expect(active).toHaveLength(1)
     expect(active[0]?.sessionId).toBe('codex-session-b')
-    expect(active[0]?.state).toBe('thinking')
+    expect(active[0]?.state).toBe('task_start')
   })
 
   test('maps Claude Code Stop to completed instead of idle', () => {
@@ -73,7 +73,7 @@ describe('AgentStateController', () => {
           id: 'thread-a',
           cwd: '/tmp/app-project',
           name: 'App Project',
-          status: { type: 'idle' },
+          status: { type: 'active' },
           ephemeral: false,
         },
       },

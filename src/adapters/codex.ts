@@ -428,7 +428,7 @@ export class CodexAdapter extends BaseAdapter {
 
     const instance = this.ctx.manager.get(instanceId)
     if (!instance) return
-    if (!['thinking', 'executing'].includes(instance.state)) return
+    if (!['task_start', 'thinking', 'executing'].includes(instance.state)) return
 
     this.staleTimers.set(instanceId, setTimeout(() => {
       this.staleTimers.delete(instanceId)

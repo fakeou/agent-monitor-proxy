@@ -1,7 +1,15 @@
-import { readFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import type { EventBus } from './bus.js'
 import type { AgentDescriptor, AgentInstance, AgentState } from './types.js'
 import type { InstanceManager } from './manager.js'
+
+/** States that represent a finished session — stale hooks must not overwrite these.
+ *  interrupted/failed are NOT included: they represent recoverable states where
+ *  new activity (e.g. a new turn) can legitimately start. */
+const TERMINAL_STATES = new Set<AgentState>(['completed', 'stopped'])
+
+/** States where the user is actively being prompted — running events should not overwrite these. */
+const ACTIONABLE_STATES = new Set<AgentState>(['waiting_input'])
 
 type JsonObject = Record<string, unknown>
 
@@ -63,7 +71,9 @@ export class AgentStateController {
         const thread = objectValue(params.thread)
         if (thread.ephemeral === true) return null
         const instance = this.ensureCodexAppThread(thread)
-        this.updateState(instance, stateFromCodexThreadStatus(objectValue(thread.status)))
+        if (!TERMINAL_STATES.has(instance.state)) {
+          this.updateState(instance, stateFromCodexThreadStatus(objectValue(thread.status)))
+        }
         return instance
       }
 
@@ -71,7 +81,9 @@ export class AgentStateController {
         const threadId = stringValue(params.threadId)
         if (!threadId) return null
         const instance = this.ensureCodexAppThread({ id: threadId })
-        this.updateState(instance, stateFromCodexThreadStatus(objectValue(params.status)))
+        if (!TERMINAL_STATES.has(instance.state)) {
+          this.updateState(instance, stateFromCodexThreadStatus(objectValue(params.status)))
+        }
         return instance
       }
 
@@ -79,7 +91,9 @@ export class AgentStateController {
         const threadId = stringValue(params.threadId)
         if (!threadId) return null
         const instance = this.ensureCodexAppThread({ id: threadId })
-        this.updateState(instance, 'thinking')
+        if (!TERMINAL_STATES.has(instance.state)) {
+          this.updateState(instance, 'thinking')
+        }
         return instance
       }
 
@@ -115,6 +129,43 @@ export class AgentStateController {
 
   private applyHookLifecycle(instance: AgentInstance, payload: AgentHookPayload, agentType: string): void {
     const eventName = stringValue(payload.hook_event_name)
+    const currentState = instance.state
+
+    // ── State protection guards ───────────────────────────────────
+    // Inspired by Open Island's SessionState.apply() — stale hooks from an
+    // earlier task must not corrupt a session that has already reached a
+    // terminal or actionable state.
+
+    // Guard 1: terminal states are final — only UserPromptSubmit can escape
+    // (it starts a genuinely new task from the user).
+    if (TERMINAL_STATES.has(currentState) && eventName !== 'UserPromptSubmit') {
+      return
+    }
+
+    // Guard 2: actionable states (waiting_input) should not be overwritten by
+    // running events (PreToolUse → executing, PostToolUse → thinking).
+    // Allow Stop/Notification/UserPrompt/PermissionRequest since they represent
+    // user intent or genuine completion.
+    if (ACTIONABLE_STATES.has(currentState) && (eventName === 'PreToolUse' || eventName === 'PostToolUse')) {
+      // Still record tool call and track tokens — only skip the state transition.
+      if (eventName === 'PreToolUse') {
+        this.manager.recordToolCall(instance.id, {
+          name: stringValue(payload.tool_name) ?? 'unknown',
+          input: preview(payload.tool_input),
+          status: 'pending',
+        })
+      } else {
+        this.manager.recordToolCall(instance.id, {
+          name: stringValue(payload.tool_name) ?? 'unknown',
+          input: preview(payload.tool_input),
+          status: outputLooksFailed(payload.tool_output) ? 'error' : 'success',
+        })
+        this.trackPostToolTokens(instance.id, payload)
+      }
+      return
+    }
+
+    // ── Normal lifecycle ──────────────────────────────────────────
 
     switch (eventName) {
       case 'SessionStart':
@@ -128,7 +179,7 @@ export class AgentStateController {
             content: payload.prompt,
           })
         }
-        this.updateState(instance, 'thinking')
+        this.updateState(instance, 'task_start')
         break
 
       case 'PreToolUse':
@@ -146,17 +197,12 @@ export class AgentStateController {
           input: preview(payload.tool_input),
           status: outputLooksFailed(payload.tool_output) ? 'error' : 'success',
         })
-        {
-          const outputText = typeof payload.tool_output === 'string'
-            ? payload.tool_output
-            : payload.tool_output != null ? JSON.stringify(payload.tool_output) : ''
-          if (outputText.trim()) {
-            this.manager.addCurrentTaskTokens(instance.id, {
-              completionTokens: estimateTokens(outputText),
-            })
-          }
+        this.trackPostToolTokens(instance.id, payload)
+        if (stringValue(payload.tool_name) === 'AskUserQuestion') {
+          this.updateState(instance, 'waiting_input')
+        } else {
+          this.updateState(instance, 'thinking')
         }
-        this.updateState(instance, 'thinking')
         break
 
       case 'Notification':
@@ -168,24 +214,29 @@ export class AgentStateController {
       case 'Stop': {
         this.updateState(instance, 'completed')
 
-        // Read real agent output tokens from transcript JSONL.
-        // Only count output_tokens (agent's own work), not input_tokens (user prompt).
-        // Subtract already-settled completionTokens to avoid double-counting across Stops.
         if (instance.watchPath) {
-          try {
-            const totalOutput = readTranscriptOutputTokens(instance.watchPath)
-            const alreadySettled = instance.stats.completionTokens
-            const delta = Math.max(0, totalOutput - alreadySettled)
-            if (delta > 0) {
-              this.manager.updateCurrentTokenBucket(instance.id, {
-                promptTokens: 0,
-                completionTokens: delta,
-                totalTokens: delta,
-              })
-            }
-          } catch {
-            // Transcript read failed — fall back to addCurrentTaskTokens estimates
-          }
+          readTranscriptOutputTokens(instance.watchPath)
+            .then((totalOutput) => {
+              const alreadySettled = instance.stats.completionTokens
+              const delta = Math.max(0, totalOutput - alreadySettled)
+              if (delta > 0) {
+                this.manager.updateCurrentTokenBucket(instance.id, {
+                  promptTokens: 0,
+                  completionTokens: delta,
+                  totalTokens: delta,
+                })
+              }
+              this.manager.commitTokenBucket(instance.id, `${agentType}_stop`)
+              instance.hookManaged = false
+              this.emitCompleted(instance, `${agentType}_stop`)
+            })
+            .catch(() => {
+              // Transcript read failed — fall back to addCurrentTaskTokens estimates
+              this.manager.commitTokenBucket(instance.id, `${agentType}_stop`)
+              instance.hookManaged = false
+              this.emitCompleted(instance, `${agentType}_stop`)
+            })
+          return
         }
 
         this.manager.commitTokenBucket(instance.id, `${agentType}_stop`)
@@ -196,6 +247,17 @@ export class AgentStateController {
 
       default:
         break
+    }
+  }
+
+  private trackPostToolTokens(instanceId: string, payload: AgentHookPayload): void {
+    const outputText = typeof payload.tool_output === 'string'
+      ? payload.tool_output
+      : payload.tool_output != null ? JSON.stringify(payload.tool_output) : ''
+    if (outputText.trim()) {
+      this.manager.addCurrentTaskTokens(instanceId, {
+        completionTokens: estimateTokens(outputText),
+      })
     }
   }
 
@@ -293,8 +355,8 @@ function estimateTokens(text: string): number {
 }
 
 /** Read transcript JSONL and sum only agent output tokens (not user input). */
-function readTranscriptOutputTokens(filePath: string): number {
-  const content = readFileSync(filePath, 'utf-8')
+async function readTranscriptOutputTokens(filePath: string): Promise<number> {
+  const content = await readFile(filePath, 'utf-8')
   const seen = new Set<string>()
   let total = 0
 

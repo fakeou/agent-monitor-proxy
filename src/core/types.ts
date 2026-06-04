@@ -9,6 +9,7 @@
 
 export type AgentState =
   | 'idle'           // Agent is running but not processing
+  | 'task_start'     // User submitted a prompt, task is starting
   | 'thinking'       // Waiting for LLM API response
   | 'executing'      // Running a tool (Bash, Read, Write, etc.)
   | 'waiting_input'  // Needs user input (approval, prompt, etc.)
@@ -18,7 +19,7 @@ export type AgentState =
   | 'stopped'        // Process exited
 
 export const AGENT_STATE_ORDER: AgentState[] = [
-  'idle', 'thinking', 'executing', 'waiting_input', 'completed', 'interrupted', 'failed', 'stopped',
+  'idle', 'task_start', 'thinking', 'executing', 'waiting_input', 'completed', 'interrupted', 'failed', 'stopped',
 ]
 
 // ─── Agent Instance ─────────────────────────────────────────────

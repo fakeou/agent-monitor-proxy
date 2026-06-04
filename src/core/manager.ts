@@ -435,7 +435,7 @@ export class InstanceManager {
     const all = this.getAll()
     const byType: Record<string, { count: number; tokens: number }> = {}
     const byState: Record<AgentState, number> = {
-      idle: 0, thinking: 0, executing: 0, waiting_input: 0,
+      idle: 0, task_start: 0, thinking: 0, executing: 0, waiting_input: 0,
       completed: 0, interrupted: 0, failed: 0, stopped: 0,
     }
 
