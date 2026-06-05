@@ -105,12 +105,11 @@ export class AMPHttpServer {
         }
       } else if (url.pathname === '/api/summary' && method === 'GET') {
         this.json(res, this.manager.getSummary())
-      } else if (url.pathname === '/api/hooks/claude-code' && method === 'POST') {
-        await this.handleClaudeCodeHook(req, res)
-      } else if (url.pathname === '/api/hooks/codex' && method === 'POST') {
-        await this.handleCodexHook(req, res)
+      } else if (method === 'POST' && url.pathname.startsWith('/api/hooks/')) {
+        const agentType = url.pathname.slice('/api/hooks/'.length)
+        await this.handleCliHook(agentType, req, res)
       } else if (url.pathname === '/api/events/codex-app' && method === 'POST') {
-        await this.handleCodexAppNotification(req, res)
+        await this.handleNotification(req, res)
       } else if (url.pathname === '/api/events' && method === 'GET') {
         // Server-Sent Events stream
         this.handleSSE(req, res)
@@ -197,46 +196,18 @@ export class AMPHttpServer {
 
   // ── Hook Handlers ─────────────────────────────────────────────
 
-  /**
-   * Handle Claude Code hook events.
-   * Claude Code POSTs hook data to this endpoint.
-   *
-   * Hook payload:
-   * {
-   *   session_id: string,
-   *   hook_event_name: "PreToolUse" | "PostToolUse" | "Notification" | "Stop" | "SubagentStop",
-   *   tool_name?: string,
-   *   tool_input?: object,
-   *   tool_output?: string,
-   *   transcript_path?: string
-   * }
-   */
-  private async handleClaudeCodeHook(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  private async handleCliHook(agentType: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
     const body = await this.readBody(req)
     try {
       const hook = JSON.parse(body)
-      const instance = this.stateController.handleClaudeHook(hook)
-      this.json(res, { ok: true, event: hook.hook_event_name, instanceId: instance.id })
-    } catch (err) {
-      this.json(res, { error: 'Invalid hook payload', detail: String(err) }, 400)
-    }
-  }
-
-  /**
-   * Handle Codex hook events (for future use).
-   */
-  private async handleCodexHook(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const body = await this.readBody(req)
-    try {
-      const hook = JSON.parse(body)
-      const instance = this.stateController.handleCodexHook(hook)
+      const instance = this.stateController.handleHook(agentType, hook)
       this.json(res, { ok: true, event: hook.hook_event_name, instanceId: instance.id })
     } catch {
       this.json(res, { error: 'Invalid payload' }, 400)
     }
   }
 
-  private async handleCodexAppNotification(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  private async handleNotification(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const body = await this.readBody(req)
     try {
       const notification = JSON.parse(body)

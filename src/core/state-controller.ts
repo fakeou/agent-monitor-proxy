@@ -29,105 +29,96 @@ export interface CodexAppNotification {
   params?: unknown
 }
 
+const CLI_HOOK_TYPES: Record<string, { type: string; displayName: string }> = {
+  'claude-code': { type: 'claude-code', displayName: 'Claude Code' },
+  'codex': { type: 'codex', displayName: 'Codex CLI' },
+}
+
 export class AgentStateController {
   constructor(
     private readonly manager: InstanceManager,
     private readonly bus: EventBus,
   ) {}
 
-  handleCodexHook(payload: AgentHookPayload): AgentInstance {
+  handleHook(agentType: string, payload: AgentHookPayload): AgentInstance {
+    const config = CLI_HOOK_TYPES[agentType] ?? { type: agentType, displayName: agentType }
     const instance = this.ensureCurrentSession({
-      type: 'codex',
+      type: config.type,
       kind: 'cli',
-      displayName: displayName('Codex CLI', payload.cwd, payload.session_id),
+      displayName: displayName(config.displayName, payload.cwd, payload.session_id),
       sessionId: sessionId(payload),
       projectPath: stringValue(payload.cwd),
       watchPath: stringValue(payload.transcript_path),
     })
 
-    this.applyHookLifecycle(instance, payload, 'codex')
+    this.applyHookLifecycle(instance, payload)
     return instance
   }
 
-  handleClaudeHook(payload: AgentHookPayload): AgentInstance {
-    const instance = this.ensureCurrentSession({
-      type: 'claude-code',
-      kind: 'cli',
-      displayName: displayName('Claude Code', payload.cwd, payload.session_id),
-      sessionId: sessionId(payload),
-      projectPath: stringValue(payload.cwd),
-      watchPath: stringValue(payload.transcript_path),
-    })
+  handleCodexHook(payload: AgentHookPayload): AgentInstance {
+    return this.handleHook('codex', payload)
+  }
 
-    this.applyHookLifecycle(instance, payload, 'claude-code')
-    return instance
+  handleClaudeHook(payload: AgentHookPayload): AgentInstance {
+    return this.handleHook('claude-code', payload)
   }
 
   handleCodexAppNotification(notification: CodexAppNotification): AgentInstance | null {
     const params = objectValue(notification.params)
 
-    switch (notification.method) {
-      case 'thread/started': {
-        const thread = objectValue(params.thread)
-        if (thread.ephemeral === true) return null
-        const instance = this.ensureCodexAppThread(thread)
-        if (!TERMINAL_STATES.has(instance.state)) {
-          this.updateState(instance, stateFromCodexThreadStatus(objectValue(thread.status)))
-        }
-        return instance
+    // thread/started has special ephemeral check and carries full thread object
+    if (notification.method === 'thread/started') {
+      const thread = objectValue(params.thread)
+      if (thread.ephemeral === true) return null
+      const instance = this.ensureCodexAppThread(thread)
+      if (!TERMINAL_STATES.has(instance.state)) {
+        this.updateState(instance, stateFromCodexThreadStatus(objectValue(thread.status)))
       }
+      return instance
+    }
 
-      case 'thread/status/changed': {
-        const threadId = stringValue(params.threadId)
-        if (!threadId) return null
-        const instance = this.ensureCodexAppThread({ id: threadId })
+    // All other methods share: extract threadId → ensure instance → apply state
+    const threadId = stringValue(params.threadId)
+    if (!threadId) return null
+    const instance = this.ensureCodexAppThread({ id: threadId })
+
+    switch (notification.method) {
+      case 'thread/status/changed':
         if (!TERMINAL_STATES.has(instance.state)) {
           this.updateState(instance, stateFromCodexThreadStatus(objectValue(params.status)))
         }
-        return instance
-      }
+        break
 
-      case 'turn/started': {
-        const threadId = stringValue(params.threadId)
-        if (!threadId) return null
-        const instance = this.ensureCodexAppThread({ id: threadId })
+      case 'turn/started':
         if (!TERMINAL_STATES.has(instance.state)) {
           this.updateState(instance, 'thinking')
         }
-        return instance
-      }
+        break
 
       case 'turn/completed': {
-        const threadId = stringValue(params.threadId)
-        if (!threadId) return null
         const turn = objectValue(params.turn)
         const status = stringValue(turn.status)
-        const instance = this.ensureCodexAppThread({ id: threadId })
         const state: AgentState = status === 'interrupted'
           ? 'interrupted'
-          : status === 'failed'
-            ? 'failed'
-            : 'completed'
+          : status === 'failed' ? 'failed' : 'completed'
         this.updateState(instance, state)
         this.emitCompleted(instance, state === 'interrupted' ? 'turn_interrupted' : status === 'failed' ? 'turn_failed' : 'turn_completed')
-        return instance
+        break
       }
 
-      case 'thread/closed': {
-        const threadId = stringValue(params.threadId)
-        if (!threadId) return null
-        const instance = this.ensureCodexAppThread({ id: threadId })
+      case 'thread/closed':
         this.updateState(instance, 'completed')
         this.emitCompleted(instance, 'thread_closed')
-        return instance
-      }
+        break
 
       default:
         return null
     }
+
+    return instance
   }
 
-  private applyHookLifecycle(instance: AgentInstance, payload: AgentHookPayload, agentType: string): void {
+  private applyHookLifecycle(instance: AgentInstance, payload: AgentHookPayload): void {
     const eventName = stringValue(payload.hook_event_name)
     const currentState = instance.state
 
@@ -226,22 +217,22 @@ export class AgentStateController {
                   totalTokens: delta,
                 })
               }
-              this.manager.commitTokenBucket(instance.id, `${agentType}_stop`)
+              this.manager.commitTokenBucket(instance.id, `${instance.type}_stop`)
               instance.hookManaged = false
-              this.emitCompleted(instance, `${agentType}_stop`)
+              this.emitCompleted(instance, `${instance.type}_stop`)
             })
             .catch(() => {
               // Transcript read failed — fall back to addCurrentTaskTokens estimates
-              this.manager.commitTokenBucket(instance.id, `${agentType}_stop`)
+              this.manager.commitTokenBucket(instance.id, `${instance.type}_stop`)
               instance.hookManaged = false
-              this.emitCompleted(instance, `${agentType}_stop`)
+              this.emitCompleted(instance, `${instance.type}_stop`)
             })
           return
         }
 
-        this.manager.commitTokenBucket(instance.id, `${agentType}_stop`)
+        this.manager.commitTokenBucket(instance.id, `${instance.type}_stop`)
         instance.hookManaged = false
-        this.emitCompleted(instance, `${agentType}_stop`)
+        this.emitCompleted(instance, `${instance.type}_stop`)
         break
       }
 
