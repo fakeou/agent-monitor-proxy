@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>AMP Debug Panel</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -31,6 +32,12 @@
       padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;
     }
     .refresh-btn:hover { background: #30363d; }
+    .clear-btn {
+      background: #21262d; color: #f85149; border: 1px solid #30363d;
+      padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;
+      margin-left: 4px;
+    }
+    .clear-btn:hover { background: #30363d; }
 
     .summary-cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-bottom: 16px; }
     .card {
@@ -56,6 +63,7 @@
       font-size: 11px; font-weight: 600;
     }
     .state-idle { background: #21262d; color: #8b949e; }
+    .state-task_start { background: #1a2a3a; color: #79c0ff; }
     .state-thinking { background: #1f3a5f; color: #58a6ff; }
     .state-executing { background: #2d1f0a; color: #d29922; }
     .state-waiting_input { background: #2d1f3a; color: #bc8cff; }
@@ -77,6 +85,7 @@
     .event-type { min-width: 140px; font-weight: 600; }
     .event-type.state_change { color: #58a6ff; }
     .event-type.token_usage { color: #d29922; }
+    .event-type.token_update { color: #d29922; }
     .event-type.tool_call { color: #bc8cff; }
     .event-type.tool_result { color: #3fb950; }
     .event-type.message { color: #c9d1d9; }
@@ -84,17 +93,30 @@
     .event-type.instance_lost { color: #f85149; }
     .event-type.completed { color: #3fb950; }
     .event-type.init { color: #58a6ff; }
+    .event-type.system { color: #484f58; }
     .event-data { color: #8b949e; flex: 1; word-break: break-all; }
+    .event-detail { color: #58a6ff; }
     .empty { color: #484f58; font-style: italic; padding: 20px; text-align: center; }
+
+    .filter-bar {
+      display: flex; gap: 8px; margin-bottom: 8px; align-items: center; flex-wrap: wrap;
+    }
+    .filter-bar input {
+      background: #0d1117; border: 1px solid #30363d; color: #c9d1d9;
+      padding: 4px 8px; border-radius: 4px; font-size: 12px; width: 200px;
+    }
+    .filter-bar label { font-size: 11px; color: #8b949e; display: flex; align-items: center; gap: 4px; }
+    .filter-bar input[type="checkbox"] { accent-color: #58a6ff; }
   </style>
 </head>
 <body>
   <div class="header">
-    <h1>🔍 Agent Monitor Proxy — Debug Panel</h1>
+    <h1>Agent Monitor Proxy - Debug Panel</h1>
     <div class="status">
       <div class="dot" id="status-dot"></div>
       <span id="status-text">Connecting...</span>
-      <button class="refresh-btn" onclick="refresh()">↻ Refresh</button>
+      <button class="refresh-btn" onclick="refresh()">Refresh</button>
+      <button class="clear-btn" onclick="clearEvents()">Clear Log</button>
     </div>
   </div>
 
@@ -108,55 +130,65 @@
 
   <div class="grid">
     <div class="panel">
-      <h2>📦 Instances</h2>
+      <h2>Instances</h2>
       <table>
-        <thead><tr><th>Type</th><th>Kind</th><th>State</th><th>Current Tokens</th><th>Tools</th><th>Session</th></tr></thead>
+        <thead><tr><th>Type</th><th>State</th><th>Current Tokens</th><th>Tools</th><th>Session</th><th>Last Activity</th></tr></thead>
         <tbody id="instances-body"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
       </table>
     </div>
     <div class="panel">
-      <h2>📊 By Type</h2>
+      <h2>By Type</h2>
       <table>
-        <thead><tr><th>Type</th><th>Count</th><th>Current Tokens</th></tr></thead>
+        <thead><tr><th>Type</th><th>Count</th><th>Total Tokens (settled)</th></tr></thead>
         <tbody id="types-body"><tr><td colspan="3" class="empty">Loading...</td></tr></tbody>
       </table>
     </div>
     <div class="panel full">
-      <h2>📡 Event Log <span id="event-count" style="color:#484f58">(0)</span></h2>
+      <h2>Event Log <span id="event-count" style="color:#484f58">(0)</span></h2>
+      <div class="filter-bar">
+        <input type="text" id="event-filter" placeholder="Filter events..." oninput="renderAllEvents()">
+        <label><input type="checkbox" id="filter-state" checked onchange="renderAllEvents()"> state_change</label>
+        <label><input type="checkbox" id="filter-tool" checked onchange="renderAllEvents()"> tool</label>
+        <label><input type="checkbox" id="filter-token" checked onchange="renderAllEvents()"> token</label>
+        <label><input type="checkbox" id="filter-message" checked onchange="renderAllEvents()"> message</label>
+        <label><input type="checkbox" id="filter-lifecycle" checked onchange="renderAllEvents()"> lifecycle</label>
+      </div>
       <div class="event-log" id="event-log"><div class="empty">Waiting for events...</div></div>
     </div>
   </div>
 
   <script>
-    const WebSocket = require('ws')
     const events = []
     let instancesCache = []
     const MAX_EVENTS = 500
-    const AMP_WS = 'ws://127.0.0.1:9527'
-    const AMP_HTTP = 'http://127.0.0.1:9527'
+
+    // Auto-detect AMP server location from the page URL
+    const loc = window.location
+    const WS_URL = `ws://${loc.hostname}:${loc.port}`
+    const HTTP_URL = `${loc.protocol}//${loc.hostname}:${loc.port}`
 
     // ── WebSocket ──────────────────────────────────────────
     let ws = null
     function connectWS() {
-      ws = new WebSocket(AMP_WS)
-      ws.on('open', () => {
+      ws = new WebSocket(WS_URL)
+      ws.onopen = () => {
         document.getElementById('status-dot').classList.add('connected')
-        document.getElementById('status-text').textContent = 'Connected'
+        document.getElementById('status-text').textContent = `Connected (${WS_URL})`
         addEvent({ type: 'system', timestamp: Date.now(), data: { msg: 'WebSocket connected' } })
-      })
-      ws.on('message', (data) => {
+      }
+      ws.onmessage = (e) => {
         try {
-          const event = JSON.parse(data.toString())
+          const event = JSON.parse(e.data)
           addEvent(event)
           applyEvent(event)
         } catch {}
-      })
-      ws.on('close', () => {
+      }
+      ws.onclose = () => {
         document.getElementById('status-dot').classList.remove('connected')
-        document.getElementById('status-text').textContent = 'Disconnected — reconnecting...'
+        document.getElementById('status-text').textContent = 'Disconnected - reconnecting...'
         setTimeout(connectWS, 3000)
-      })
-      ws.on('error', () => {})
+      }
+      ws.onerror = () => {}
     }
 
     function applyEvent(event) {
@@ -207,6 +239,13 @@
         instance.currentTaskTokens = event.data.currentTaskTokens
       }
 
+      if (event.type === 'token_usage') {
+        // Update settled stats from token_usage events
+        if (event.data?.settledTokens) {
+          instance.stats.totalTokens = Number(instance.stats.totalTokens || 0) + Number(event.data.settledTokens.totalTokens || 0)
+        }
+      }
+
       if (event.type === 'tool_call' || event.type === 'tool_result') {
         instance.stats.toolCallCount = Number(instance.stats.toolCallCount || 0) + 1
       }
@@ -215,6 +254,7 @@
         instance.stats.messageCount = Number(instance.stats.messageCount || 0) + 1
       }
 
+      instance.lastActivityAt = event.timestamp
       renderInstances(instancesCache)
       renderSummary(instancesCache)
     }
@@ -222,39 +262,105 @@
     function addEvent(event) {
       events.unshift(event)
       if (events.length > MAX_EVENTS) events.length = MAX_EVENTS
-      renderEvent(event)
+      renderEvent(event, true)
       document.getElementById('event-count').textContent = `(${events.length})`
     }
 
-    function renderEvent(event) {
+    function clearEvents() {
+      events.length = 0
+      renderAllEvents()
+      document.getElementById('event-count').textContent = '(0)'
+    }
+
+    function shouldShowEvent(event) {
+      const text = document.getElementById('event-filter').value.toLowerCase()
+      if (text) {
+        const hay = `${event.type} ${event.instanceId || ''} ${JSON.stringify(event.data || {})}`.toLowerCase()
+        if (!hay.includes(text)) return false
+      }
+
+      const t = event.type
+      if (t === 'state_change' && !document.getElementById('filter-state').checked) return false
+      if ((t === 'tool_call' || t === 'tool_result') && !document.getElementById('filter-tool').checked) return false
+      if ((t === 'token_usage' || t === 'token_update') && !document.getElementById('filter-token').checked) return false
+      if (t === 'message' && !document.getElementById('filter-message').checked) return false
+      if ((t === 'instance_discovered' || t === 'instance_lost' || t === 'completed') && !document.getElementById('filter-lifecycle').checked) return false
+
+      return true
+    }
+
+    function renderAllEvents() {
+      const log = document.getElementById('event-log')
+      log.innerHTML = ''
+      const visible = events.filter(shouldShowEvent)
+      if (!visible.length) {
+        log.innerHTML = '<div class="empty">No matching events</div>'
+        return
+      }
+      for (const event of visible) renderEvent(event, false)
+      document.getElementById('event-count').textContent = `(${events.length})`
+    }
+
+    function renderEvent(event, prepend) {
+      if (!shouldShowEvent(event)) return
       const log = document.getElementById('event-log')
       if (log.querySelector('.empty')) log.innerHTML = ''
       const entry = document.createElement('div')
       entry.className = 'event-entry'
       const time = new Date(event.timestamp).toLocaleTimeString()
-      const dataStr = JSON.stringify(event.data || {})
-      const shortData = dataStr.length > 150 ? dataStr.slice(0, 150) + '...' : dataStr
+      const detail = formatEventDetail(event)
       entry.innerHTML = `
         <span class="event-time">${time}</span>
         <span class="event-type ${event.type}">${event.type}</span>
-        <span class="event-data">${event.instanceId || ''} ${shortData}</span>
+        <span class="event-data">${event.instanceId || ''} ${detail}</span>
       `
-      log.insertBefore(entry, log.firstChild)
-      while (log.children.length > 200) log.removeChild(log.lastChild)
+      if (prepend) {
+        log.insertBefore(entry, log.firstChild)
+        while (log.children.length > 200) log.removeChild(log.lastChild)
+      } else {
+        log.appendChild(entry)
+      }
+    }
+
+    function formatEventDetail(event) {
+      const d = event.data || {}
+      switch (event.type) {
+        case 'state_change':
+          return `<span class="event-detail">${d.previousState} -> ${d.newState}</span> ${d.agentType || ''}`
+        case 'tool_call':
+        case 'tool_result':
+          return `<span class="event-detail">${d.name}</span> ${d.status || ''} ${(d.inputPreview || '').slice(0, 80)}`
+        case 'token_usage':
+          return `<span class="event-detail">${d.reason || ''}</span> ${d.settledTokens?.totalTokens?.toLocaleString() || 0} tokens`
+        case 'token_update':
+          return `${d.updateKind || ''} current=${d.currentTaskTokens?.totalTokens?.toLocaleString() || 0}`
+        case 'message':
+          return `<span class="event-detail">${d.role}</span> ${(d.contentPreview || '').slice(0, 100)}`
+        case 'instance_discovered':
+          return `${d.type} ${d.displayName || ''}`
+        case 'instance_lost':
+          return `${d.type} ${d.reason || ''}`
+        case 'completed':
+          return `<span class="event-detail">${d.reason || ''}</span> ${d.session_id || ''}`
+        default:
+          return JSON.stringify(d).slice(0, 150)
+      }
     }
 
     // ── HTTP Fetch ─────────────────────────────────────────
     async function refresh() {
       try {
         const [instances, summary] = await Promise.all([
-          fetch(`${AMP_HTTP}/api/instances`).then(r => r.json()),
-          fetch(`${AMP_HTTP}/api/summary`).then(r => r.json()),
+          fetch(`${HTTP_URL}/api/instances`).then(r => r.json()),
+          fetch(`${HTTP_URL}/api/summary`).then(r => r.json()),
         ])
         instancesCache = instances
         renderInstances(instancesCache)
         renderSummary(instancesCache)
+        addEvent({ type: 'system', timestamp: Date.now(), data: { msg: 'Refreshed from HTTP', instances: instances.length } })
       } catch (err) {
         console.error('Refresh failed:', err)
+        addEvent({ type: 'system', timestamp: Date.now(), data: { msg: 'Refresh failed: ' + err.message } })
       }
     }
 
@@ -266,12 +372,12 @@
       }
       tbody.innerHTML = instances.map(i => `
         <tr>
-          <td>${i.type}</td>
-          <td>${i.kind}</td>
+          <td title="${i.displayName || i.type}">${i.type}</td>
           <td><span class="state state-${i.state}">${i.state}</span></td>
           <td title="${formatTokenBreakdown(i.currentTaskTokens)}">${getCurrentTokens(i).toLocaleString()}</td>
           <td>${i.stats.toolCallCount}</td>
-          <td title="${i.id}">${(i.sessionId || i.watchPath || i.id || '-').slice(0, 20)}</td>
+          <td title="${i.id}">${(i.sessionId || i.watchPath || i.id || '-').slice(0, 24)}</td>
+          <td>${formatTime(i.lastActivityAt)}</td>
         </tr>
       `).join('')
     }
@@ -290,7 +396,7 @@
       const byType = instances.reduce((acc, i) => {
         if (!acc[i.type]) acc[i.type] = { count: 0, tokens: 0 }
         acc[i.type].count++
-        acc[i.type].tokens += getCurrentTokens(i)
+        acc[i.type].tokens += Number(i.stats?.totalTokens || 0)
         return acc
       }, {})
       const types = Object.entries(byType)
@@ -308,11 +414,17 @@
     }
 
     function formatTokenBreakdown(tokens) {
-      const prompt = Number(tokens?.promptTokens || 0).toLocaleString()
-      const completion = Number(tokens?.completionTokens || 0).toLocaleString()
-      const cached = Number(tokens?.cachedPromptTokens || 0).toLocaleString()
-      const reasoning = Number(tokens?.reasoningTokens || 0).toLocaleString()
-      return `prompt ${prompt}, completion ${completion}, cached ${cached}, reasoning ${reasoning}`
+      const p = Number(tokens?.promptTokens || 0).toLocaleString()
+      const c = Number(tokens?.completionTokens || 0).toLocaleString()
+      const ca = Number(tokens?.cachedPromptTokens || 0).toLocaleString()
+      const r = Number(tokens?.reasoningTokens || 0).toLocaleString()
+      return `prompt=${p} completion=${c} cached=${ca} reasoning=${r}`
+    }
+
+    function formatTime(ts) {
+      if (!ts) return '-'
+      const d = new Date(ts)
+      return d.toLocaleTimeString()
     }
 
     // ── Init ───────────────────────────────────────────────

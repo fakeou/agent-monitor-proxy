@@ -5,11 +5,16 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { readFile } from 'node:fs/promises'
+import { resolve, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { WebSocketServer, WebSocket } from 'ws'
 import type { InstanceManager } from '../core/manager.js'
 import type { EventBus, EventListener } from '../core/bus.js'
 import type { ServerConfig } from '../core/types.js'
 import { AgentStateController } from '../core/state-controller.js'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
 
 export class AMPHttpServer {
   private httpServer: ReturnType<typeof createServer> | null = null
@@ -83,7 +88,9 @@ export class AMPHttpServer {
 
     try {
       // Route matching
-      if (url.pathname === '/health') {
+      if (url.pathname === '/' || url.pathname === '/debug') {
+        await this.serveDebugPanel(res)
+      } else if (url.pathname === '/health') {
         this.json(res, { status: 'ok', timestamp: Date.now() })
       } else if (url.pathname === '/api/instances' && method === 'GET') {
         this.json(res, this.manager.getAll())
@@ -224,6 +231,21 @@ export class AMPHttpServer {
       req.on('data', (chunk) => { body += chunk.toString() })
       req.on('end', () => { resolve(body) })
     })
+  }
+
+  // ── Debug Panel ─────────────────────────────────────────────
+
+  private async serveDebugPanel(res: ServerResponse): Promise<void> {
+    try {
+      // Resolve relative to the project root (two levels up from dist/server/)
+      const htmlPath = resolve(__dirname, '..', '..', 'debug-panel', 'index.html')
+      const html = await readFile(htmlPath, 'utf-8')
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(html)
+    } catch {
+      res.writeHead(404, { 'Content-Type': 'text/plain' })
+      res.end('Debug panel not found. Run from the project root.')
+    }
   }
 
   // ── Helpers ──────────────────────────────────────────────────
