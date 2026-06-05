@@ -337,14 +337,24 @@
         case 'message':
           return `<span class="event-detail">${d.role}</span> ${(d.contentPreview || '').slice(0, 100)}`
         case 'instance_discovered':
-          return `${d.type} ${d.displayName || ''}`
+          return `${TYPE_LABELS[d.type] || d.type} ${d.displayName || ''}`
         case 'instance_lost':
-          return `${d.type} ${d.reason || ''}`
+          return `${TYPE_LABELS[d.type] || d.type} ${d.reason || ''}`
         case 'completed':
           return `<span class="event-detail">${d.reason || ''}</span> ${d.session_id || ''}`
         default:
           return JSON.stringify(d).slice(0, 150)
       }
+    }
+
+    const TYPE_LABELS = {
+      'claude-code': 'Claude Code',
+      'codex': 'Codex CLI',
+      'codex-app': 'Codex App',
+    }
+
+    function typeLabel(instance) {
+      return TYPE_LABELS[instance.type] || instance.type
     }
 
     // ── HTTP Fetch ─────────────────────────────────────────
@@ -372,7 +382,7 @@
       }
       tbody.innerHTML = instances.map(i => `
         <tr>
-          <td title="${i.displayName || i.type}">${i.type}</td>
+          <td title="${i.displayName || i.type}">${typeLabel(i)}</td>
           <td><span class="state state-${i.state}">${i.state}</span></td>
           <td title="${formatTokenBreakdown(i.currentTaskTokens)}">${getCurrentTokens(i).toLocaleString()}</td>
           <td>${i.stats.toolCallCount}</td>
@@ -405,7 +415,7 @@
         return
       }
       tbody.innerHTML = types.map(([t, d]) => `
-        <tr><td>${t}</td><td>${d.count}</td><td>${d.tokens.toLocaleString()}</td></tr>
+        <tr><td>${TYPE_LABELS[t] || t}</td><td>${d.count}</td><td>${d.tokens.toLocaleString()}</td></tr>
       `).join('')
     }
 
