@@ -1,6 +1,6 @@
 {
   "name": "agent-monitor-proxy",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Universal monitoring proxy for AI coding agents. Discover, intercept, and observe all your Claude Code, Codex, Cursor, and other agents from a single service.",
   "type": "module",
   "main": "dist/index.js",
