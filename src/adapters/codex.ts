@@ -17,6 +17,7 @@
  */
 
 import { readdir, readFile, stat } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
 import { watch, type FSWatcher } from 'node:fs'
 import { join, basename } from 'node:path'
 import type { AgentDescriptor, AgentInstance, AgentState, TokenBucket } from '../core/types.js'
@@ -54,19 +55,34 @@ export class CodexAdapter extends BaseAdapter {
       // ~/.codex doesn't exist
     }
 
-    const latest = candidates.sort((a, b) => b.createdAtMs - a.createdAtMs || b.mtimeMs - a.mtimeMs)[0]
-    if (!latest) {
-      return []
+    if (!candidates.length) return []
+
+    // Group by type (codex vs codex-app), pick latest of each
+    const byType = new Map<string, CodexSessionCandidate[]>()
+    for (const c of candidates) {
+      const t = c.descriptor.type
+      const arr = byType.get(t) ?? []
+      arr.push(c)
+      byType.set(t, arr)
     }
 
-    for (const instance of this.ctx.manager.getByType(this.type)) {
-      if (instance.hookManaged) continue
-      if (instance.sessionId === latest.descriptor.sessionId) continue
-      await this.stopWatching(instance.id)
-      this.ctx.manager.unregister(instance.id)
+    const latest: AgentDescriptor[] = []
+    for (const [, arr] of byType) {
+      arr.sort((a, b) => b.createdAtMs - a.createdAtMs || b.mtimeMs - a.mtimeMs)
+      latest.push(arr[0]!.descriptor)
     }
 
-    return [latest.descriptor]
+    // Unregister stale instances for all codex-related types
+    for (const type of ['codex', 'codex-app']) {
+      for (const instance of this.ctx.manager.getByType(type)) {
+        if (instance.hookManaged) continue
+        if (latest.some((d) => d.sessionId === instance.sessionId)) continue
+        await this.stopWatching(instance.id)
+        this.ctx.manager.unregister(instance.id)
+      }
+    }
+
+    return latest
   }
 
   private async scanDir(
@@ -90,14 +106,19 @@ export class CodexAdapter extends BaseAdapter {
         const sessionId = entry.replace('.jsonl', '')
         const meta = await extractSessionMeta(fullPath)
         const projectPath = meta.projectPath
+        const source = await detectSessionSource(fullPath)
+
+        const isApp = source === 'app'
+        const type = isApp ? 'codex-app' : 'codex'
+        const displayNamePrefix = isApp ? 'Codex App' : 'Codex CLI'
 
         candidates.push({
           descriptor: {
-            type: this.type,
-            kind: this.kind,
+            type,
+            kind: isApp ? 'app' : 'cli',
             displayName: projectPath
-              ? `${this.displayName} (${basename(projectPath)})`
-              : this.displayName,
+              ? `${displayNamePrefix} (${basename(projectPath)})`
+              : displayNamePrefix,
             sessionId,
             projectPath,
             watchPath: fullPath,
@@ -545,4 +566,36 @@ function getSettlementKey(entry: unknown): string {
   if (typeof timestamp === 'string' && timestamp) return timestamp
   if (typeof timestamp === 'number' && Number.isFinite(timestamp)) return String(timestamp)
   return String(Date.now())
+}
+
+/**
+ * Detect whether a session JSONL file is owned by Codex App or Codex CLI
+ * by checking which processes have the file open via lsof + ps.
+ *
+ * Codex App binary: /Applications/Codex.app/Contents/Resources/codex
+ * Codex CLI binary:  /usr/local/lib/node_modules/@openai/codex/.../bin/codex
+ */
+async function detectSessionSource(filePath: string): Promise<'app' | 'cli'> {
+  try {
+    const lsofOut = await new Promise<string>((resolve) => {
+      execFile('lsof', ['-F', 'p', filePath], { timeout: 2000 }, (_err, stdout) => {
+        resolve(stdout ?? '')
+      })
+    })
+    const pids = lsofOut.split('\n')
+      .filter((l) => l.startsWith('p'))
+      .map((l) => l.slice(1))
+    if (!pids.length) return 'cli'
+
+    // Check each PID — if any is a Codex App process, it's an app session
+    const results = await Promise.all(pids.map((pid) =>
+      new Promise<string>((resolve) => {
+        execFile('ps', ['-p', pid, '-o', 'comm='], { timeout: 2000 }, (_err, stdout) => {
+          resolve((stdout ?? '').trim())
+        })
+      }),
+    ))
+    if (results.some((comm) => comm.includes('/Applications/Codex.app/'))) return 'app'
+  } catch { /* detection failed, default to cli */ }
+  return 'cli'
 }
