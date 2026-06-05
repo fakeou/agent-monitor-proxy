@@ -134,25 +134,19 @@ export class AgentStateController {
     }
 
     // Guard 2: actionable states (waiting_input) should not be overwritten by
-    // running events (PreToolUse → executing, PostToolUse → thinking).
+    // PostToolUse (which just means the tool finished, not that the user acted).
+    // But PreToolUse means a NEW tool is executing — the user has responded and
+    // the agent is working again, so allow it to break out of waiting_input.
     // Allow Stop/Notification/UserPrompt/PermissionRequest since they represent
     // user intent or genuine completion.
-    if (ACTIONABLE_STATES.has(currentState) && (eventName === 'PreToolUse' || eventName === 'PostToolUse')) {
+    if (ACTIONABLE_STATES.has(currentState) && eventName === 'PostToolUse') {
       // Still record tool call and track tokens — only skip the state transition.
-      if (eventName === 'PreToolUse') {
-        this.manager.recordToolCall(instance.id, {
-          name: stringValue(payload.tool_name) ?? 'unknown',
-          input: preview(payload.tool_input),
-          status: 'pending',
-        })
-      } else {
-        this.manager.recordToolCall(instance.id, {
-          name: stringValue(payload.tool_name) ?? 'unknown',
-          input: preview(payload.tool_input),
-          status: outputLooksFailed(payload.tool_output) ? 'error' : 'success',
-        })
-        this.trackPostToolTokens(instance.id, payload)
-      }
+      this.manager.recordToolCall(instance.id, {
+        name: stringValue(payload.tool_name) ?? 'unknown',
+        input: preview(payload.tool_input),
+        status: outputLooksFailed(payload.tool_output) ? 'error' : 'success',
+      })
+      this.trackPostToolTokens(instance.id, payload)
       return
     }
 
@@ -266,11 +260,6 @@ export class AgentStateController {
   }
 
   private ensureCurrentSession(descriptor: AgentDescriptor): AgentInstance {
-    for (const existing of this.manager.getByType(descriptor.type)) {
-      if (existing.sessionId === descriptor.sessionId) continue
-      this.manager.unregister(existing.id)
-    }
-
     const instance = this.manager.register(descriptor)
     if (descriptor.projectPath) instance.projectPath = descriptor.projectPath
     if (descriptor.watchPath) instance.watchPath = descriptor.watchPath
