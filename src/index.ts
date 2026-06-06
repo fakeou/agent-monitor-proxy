@@ -18,6 +18,7 @@ import { AMPHttpServer } from './server/http.js'
 import { createProxyServer } from './proxy/server.js'
 import { ClaudeCodeAdapter } from './adapters/claude-code.js'
 import { CodexAdapter } from './adapters/codex.js'
+import { DimcodeAdapter } from './adapters/dimcode.js'
 import type { AMPConfig } from './core/types.js'
 import { DEFAULT_CONFIG } from './core/types.js'
 
@@ -50,6 +51,7 @@ export class AgentMonitorProxy {
     // Register built-in adapters
     this.registry.register(new ClaudeCodeAdapter())
     this.registry.register(new CodexAdapter())
+    this.registry.register(new DimcodeAdapter())
 
     // Register custom adapters
     if (options?.adapters) {
