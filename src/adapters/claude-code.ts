@@ -73,17 +73,20 @@ export class ClaudeCodeAdapter extends BaseAdapter {
       // ~/.claude doesn't exist
     }
 
-    const latest = candidates.sort((a, b) => b.mtimeMs - a.mtimeMs)[0]
-    if (!latest) return []
+    if (!candidates.length) return []
 
+    // Track all active sessions, not just the latest one
+    const activeSessionIds = new Set(candidates.map(c => c.descriptor.sessionId))
+
+    // Unregister stale instances that are no longer in the candidate set
     for (const instance of this.ctx.manager.getByType(this.type)) {
       if (instance.hookManaged) continue
-      if (instance.sessionId === latest.descriptor.sessionId) continue
+      if (activeSessionIds.has(instance.sessionId!)) continue
       await this.stopWatching(instance.id)
       this.ctx.manager.unregister(instance.id)
     }
 
-    return [latest.descriptor]
+    return candidates.map(c => c.descriptor)
   }
 
   async startWatching(instance: AgentInstance): Promise<void> {
